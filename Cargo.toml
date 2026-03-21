@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kairo-core",
+    "crates/kairo-cli",
+    "crates/kairo-llm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["KAIRO-X Contributors"]
+
+[workspace.dependencies]
+# Concurrency
+dashmap = "6"
+tokio = { version = "1", features = ["full"] }
+crossbeam-channel = "0.5"
+
+# Data structures
+smallvec = { version = "1", features = ["serde", "write", "union"] }
+bitvec = { version = "1", features = ["serde"] }
+compact_str = { version = "0.8", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+toml = "0.8"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+fnv = "1"
+
+# Text processing
+regex = "1"
+similar = "2"
+
+# Async HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.9"
+libc = "0.2"
+
+# Testing
+tempfile = "3"

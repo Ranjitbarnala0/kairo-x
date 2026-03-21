@@ -1,0 +1,114 @@
+# KAIRO-X Default Configuration
+# ================================
+# This file contains all configurable parameters for the KAIRO-X enforcement agent.
+# Copy this file and customize it for your project.
+
+[general]
+# Cost mode: "thorough", "balanced", or "efficient"
+# thorough  = full enforcement, deep audits, generous context
+# balanced  = standard enforcement, single verification, moderate context
+# efficient = minimal enforcement, critical-only audit, tight context
+cost_mode = "balanced"
+
+# Maximum parallel execution tracks (1-8)
+max_parallel_tracks = 3
+
+# Maximum retries per node before marking as failed
+# (can be overridden per-priority in [verification] section)
+max_retries_critical = 7
+max_retries_standard = 5
+max_retries_mechanical = 3
+
+[provider]
+# Primary LLM provider
+[provider.primary]
+kind = "Anthropic"
+model = "claude-sonnet-4-20250514"
+api_key_env = "ANTHROPIC_API_KEY"
+max_context_tokens = 200000
+max_output_tokens = 8192
+cost_per_input_mtok = 3000      # millidollars per Mtok: 3000 = $3.00 per million input tokens
+cost_per_output_mtok = 15000    # millidollars per Mtok: 15000 = $15.00 per million output tokens
+
+# Fallback provider (optional — remove this section to disable failover)
+[provider.fallback]
+kind = "OpenAI"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+max_context_tokens = 128000
+max_output_tokens = 4096
+cost_per_input_mtok = 2500
+cost_per_output_mtok = 10000
+
+# Audit override provider (optional — uses a different model for audit calls)
+# Uncomment to enable cross-model audit defense
+# [provider.audit_override]
+# kind = "Anthropic"
+# model = "claude-opus-4-20250514"
+# api_key_env = "ANTHROPIC_API_KEY"
+# max_context_tokens = 200000
+# max_output_tokens = 4096
+# cost_per_input_mtok = 15000
+# cost_per_output_mtok = 75000
+
+[provider.retry]
+# Maximum retries per provider before failover
+max_retries = 3
+# Base delay for exponential backoff (milliseconds)
+backoff_base_ms = 1000
+# Maximum backoff delay (milliseconds)
+backoff_max_ms = 30000
+
+[session]
+# Token threshold (% of context window) to trigger session reset
+reset_threshold_percent = 70
+# Maximum consecutive bad responses before session reset
+max_bad_response_streak = 3
+
+[verification]
+# Verification depth by priority × cost mode
+# Format: [priority].[cost_mode] = "depth"
+# Depths: "l1_full_l2_deep", "l1_full_l2_audit", "l1_full", "l1_syntax_build"
+[verification.depth]
+critical_thorough = "l1_full_l2_deep"
+critical_balanced = "l1_full_l2_audit"
+critical_efficient = "l1_full_l2_audit"
+standard_thorough = "l1_full_l2_audit"
+standard_balanced = "l1_full_l2_audit"
+standard_efficient = "l1_full"
+mechanical_thorough = "l1_full_l2_spot"
+mechanical_balanced = "l1_full"
+mechanical_efficient = "l1_syntax_build"
+
+[enforcement]
+# Base enforcement intensity by priority (0.0 to 1.0)
+intensity_critical = 0.9
+intensity_standard = 0.6
+intensity_mechanical = 0.3
+
+# Cost mode multipliers for intensity
+intensity_multiplier_thorough = 1.2
+intensity_multiplier_balanced = 1.0
+intensity_multiplier_efficient = 0.6
+
+[context]
+# Maximum context candidates to score per LLM call
+max_candidates = 50
+# Default context budget (tokens) if controller hasn't learned yet
+default_budget_tokens = 4000
+
+[persistence]
+# Checkpoint directory (relative to project root)
+checkpoint_dir = ".kairo/checkpoints"
+# Checkpoint every N steps
+checkpoint_interval = 10
+# Maximum number of checkpoints to retain (older ones are pruned)
+max_checkpoints = 20
+
+[budget]
+# Optional token budget limit in tokens (0 = unlimited)
+# token_limit = 0
+# Optional cost budget limit in microdollars (0 = unlimited)
+# cost_limit_microdollars = 0
+# Warn when budget usage reaches this percentage
+warn_threshold_percent = 80

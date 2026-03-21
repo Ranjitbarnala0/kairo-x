@@ -1,0 +1,32 @@
+[package]
+name = "kairo-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LLM provider abstraction, call assembly, and response pipeline for KAIRO-X"
+
+[dependencies]
+# Async HTTP
+reqwest.workspace = true
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Text processing
+regex.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Misc
+chrono.workspace = true
+uuid.workspace = true
+rand.workspace = true
