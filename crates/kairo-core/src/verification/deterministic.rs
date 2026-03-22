@@ -18,19 +18,25 @@ use thiserror::Error;
 /// Named verification steps in order of execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StepName {
+    Syntax,
     Build,
     Lint,
     Typecheck,
     Test,
+    TargetedTest,
+    RegressionTest,
 }
 
 impl std::fmt::Display for StepName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Syntax => write!(f, "syntax"),
             Self::Build => write!(f, "build"),
             Self::Lint => write!(f, "lint"),
             Self::Typecheck => write!(f, "typecheck"),
             Self::Test => write!(f, "test"),
+            Self::TargetedTest => write!(f, "targeted_test"),
+            Self::RegressionTest => write!(f, "regression_test"),
         }
     }
 }
@@ -59,12 +65,22 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    /// Summary of stderr (first 500 chars) for issue reporting.
+    /// Summary of stderr (first ~500 chars) for issue reporting.
+    ///
+    /// Uses char-boundary-safe truncation to avoid panicking on multi-byte
+    /// UTF-8 sequences.
     pub fn stderr_summary(&self) -> String {
         if self.stderr.len() <= 500 {
             self.stderr.clone()
         } else {
-            format!("{}... (truncated)", &self.stderr[..500])
+            let boundary = self
+                .stderr
+                .char_indices()
+                .take_while(|&(i, _)| i < 500)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            format!("{}... (truncated)", &self.stderr[..boundary])
         }
     }
 }
@@ -160,11 +176,20 @@ impl DeterministicVerifier {
 
         for (step_label, command) in &chain {
             let step_name = match *step_label {
+                "syntax" => StepName::Syntax,
                 "build" => StepName::Build,
                 "lint" => StepName::Lint,
                 "typecheck" => StepName::Typecheck,
                 "test" => StepName::Test,
-                _ => continue,
+                "targeted_test" | "targeted" => StepName::TargetedTest,
+                "regression_test" | "regression" => StepName::RegressionTest,
+                unknown => {
+                    tracing::warn!(
+                        label = unknown,
+                        "Unknown verification step label, skipping"
+                    );
+                    continue;
+                }
             };
 
             let result = self.run_step(step_name, command, project_root).await?;
@@ -295,14 +320,23 @@ impl DeterministicVerifier {
     }
 
     /// Truncate output to the maximum capture size.
+    ///
+    /// Uses char-boundary-safe truncation to avoid panicking on multi-byte
+    /// UTF-8 sequences produced by `from_utf8_lossy` replacement chars.
     fn truncate_output(&self, bytes: &[u8]) -> String {
         let s = String::from_utf8_lossy(bytes);
         if s.len() <= self.max_capture_bytes {
             s.to_string()
         } else {
+            let boundary = s
+                .char_indices()
+                .take_while(|&(i, _)| i < self.max_capture_bytes)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
             format!(
                 "{}... (truncated, {} bytes total)",
-                &s[..self.max_capture_bytes],
+                &s[..boundary],
                 s.len()
             )
         }

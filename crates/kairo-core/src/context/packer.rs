@@ -197,27 +197,33 @@ pub fn pack_context_incremental(
 
 /// Truncate content to approximately `max_tokens` tokens.
 ///
-/// Tries to break at a line boundary to avoid splitting mid-line.
-/// Appends a `[... truncated ...]` marker.
+/// Uses char-boundary-aware slicing for UTF-8 safety, then tries to break
+/// at a newline for clean truncation. Appends a truncation marker.
 fn truncate_to_tokens(content: &str, max_tokens: u32) -> String {
-    // Rough: 1 token ~ 4 bytes
-    let max_bytes = (max_tokens as usize) * 4;
-
-    if content.len() <= max_bytes {
+    let max_chars = (max_tokens as usize) * 4; // approximate chars per token budget
+    if content.len() <= max_chars {
         return content.to_string();
     }
-
-    // Find the last newline before the byte limit (don't split mid-line)
-    let search_region = &content[..max_bytes.min(content.len())];
-    let break_point = search_region.rfind('\n').unwrap_or(max_bytes);
-
-    if break_point == 0 {
+    // Find a safe char boundary — walk backwards from the target byte offset
+    // to avoid splitting a multi-byte UTF-8 sequence.
+    let mut boundary = max_chars.min(content.len());
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    if boundary == 0 {
         return String::new();
     }
-
-    let mut truncated = content[..break_point].to_string();
-    truncated.push_str("\n[... truncated ...]");
-    truncated
+    let search_region = &content[..boundary];
+    // Find the last newline for clean truncation (don't split mid-line)
+    if let Some(last_nl) = search_region.rfind('\n') {
+        format!(
+            "{}\n// ... truncated ({} tokens estimated)",
+            &content[..last_nl],
+            max_tokens
+        )
+    } else {
+        format!("{}\n// ... truncated", &content[..boundary])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +304,7 @@ mod tests {
 
         assert_eq!(packed.len(), 1);
         assert!(packed.items[0].truncated);
-        assert!(packed.items[0].content.contains("[... truncated ...]"));
+        assert!(packed.items[0].content.contains("// ... truncated"));
     }
 
     #[test]
@@ -318,12 +324,13 @@ mod tests {
     #[test]
     fn test_pack_greedy_fill() {
         // Create two candidates, budget only fits one
-        let content = "x".repeat(400); // ~100 tokens each
+        // 400 chars / 3.5 = ~114 tokens each
+        let content = "x".repeat(400);
         let c1 = make_candidate("a.rs", &content, high_features());
         let c2 = make_candidate("b.rs", &content, medium_features());
 
-        // Budget fits only one candidate (100 tokens + 8 overhead = 108)
-        let packed = pack_context(vec![c1, c2], 115);
+        // Budget fits only one candidate (114 tokens + 8 overhead = 122)
+        let packed = pack_context(vec![c1, c2], 130);
         assert_eq!(packed.len(), 1);
         assert_eq!(packed.items[0].label, "a.rs"); // higher score
         assert_eq!(packed.dropped_count, 1);
@@ -348,10 +355,10 @@ mod tests {
     #[test]
     fn test_truncate_to_tokens_breaks_at_line() {
         let content = "line 1\nline 2\nline 3\nline 4\nline 5";
-        // 2 tokens = 8 bytes — should fit "line 1\n" (7 bytes) and break before "line 2"
+        // 2 tokens = 8 chars budget — should fit "line 1\n" (7 chars) and break before "line 2"
         let result = truncate_to_tokens(content, 2);
         assert!(result.contains("line 1"));
-        assert!(result.contains("[... truncated ...]"));
+        assert!(result.contains("// ... truncated"));
         assert!(!result.contains("line 5"));
     }
 

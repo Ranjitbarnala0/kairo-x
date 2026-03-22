@@ -109,6 +109,14 @@ pub enum BridgeCallResult {
 
 impl LLMBridge {
     pub fn new(manager: ProviderManager, config: BridgeConfig) -> Self {
+        if config.failover_threshold > config.max_retries_per_provider {
+            tracing::warn!(
+                threshold = config.failover_threshold,
+                max_retries = config.max_retries_per_provider,
+                "failover_threshold exceeds max_retries_per_provider; failover may never trigger"
+            );
+        }
+
         Self {
             manager,
             config,
@@ -144,6 +152,24 @@ impl LLMBridge {
         ) && continuation_count < truncation::MAX_CONTINUATIONS
         {
             continuation_count += 1;
+
+            // Guard: check that accumulated tokens still fit in the context window
+            // before building the next continuation request.
+            let estimated_input = request.messages.iter()
+                .map(|m| m.estimated_tokens() as u64)
+                .sum::<u64>();
+            let spec = self.manager.active_spec();
+            let max_context = spec.max_context_tokens as u64;
+            if estimated_input + spec.max_output_tokens as u64 > max_context {
+                tracing::warn!(
+                    estimated_input,
+                    max_context,
+                    max_output = spec.max_output_tokens,
+                    "Continuation would exceed context window, stopping"
+                );
+                break;
+            }
+
             tracing::info!(
                 continuation = continuation_count,
                 "Response truncated, sending continuation request"
@@ -203,9 +229,10 @@ impl LLMBridge {
         let audit_spec = self.manager.audit_spec();
         let active_spec = self.manager.active_spec();
 
-        // If the audit spec is a different provider/model, dispatch directly to it
+        // If the audit spec is a different provider/model, still route through
+        // retries so transient failures don't silently drop audit calls.
         if audit_spec.kind != active_spec.kind || audit_spec.model != active_spec.model {
-            let response = self.send_to_provider(audit_spec, &request).await?;
+            let response = self.call_with_retries_for_spec(audit_spec, &request).await?;
             return Ok(BridgeCallResult::Success(response));
         }
 
@@ -273,6 +300,50 @@ impl LLMBridge {
         }
     }
 
+    /// Retry loop for a specific provider spec (no failover).
+    ///
+    /// Used by `call_audit` when the audit provider differs from the active
+    /// provider — we want retry resilience but failover doesn't apply since
+    /// the caller explicitly chose this provider.
+    async fn call_with_retries_for_spec(
+        &self,
+        spec: &ProviderSpec,
+        request: &LLMRequest,
+    ) -> Result<LLMRawResponse, BridgeError> {
+        let mut last_error: Option<ProviderError> = None;
+
+        for attempt in 0..self.config.max_retries_per_provider {
+            match self.send_to_provider(spec, request).await {
+                Ok(response) => return Ok(response),
+                Err(ProviderError::RateLimited { retry_after_ms }) => {
+                    tracing::warn!(
+                        retry_after_ms,
+                        provider = %spec.model,
+                        "Rate limited on targeted provider, waiting before retry"
+                    );
+                    sleep(Duration::from_millis(retry_after_ms)).await;
+                    last_error = Some(ProviderError::RateLimited { retry_after_ms });
+                }
+                Err(e) => {
+                    let backoff = self.calculate_backoff(attempt);
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms = backoff,
+                        provider = %spec.model,
+                        error = %e,
+                        "Targeted provider call failed, retrying"
+                    );
+                    sleep(Duration::from_millis(backoff)).await;
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error
+            .map(BridgeError::Provider)
+            .unwrap_or(BridgeError::AllProvidersFailed))
+    }
+
     /// Dispatch to the appropriate provider implementation based on the spec.
     ///
     /// Provider instances are cached so the underlying `reqwest::Client`
@@ -319,18 +390,21 @@ impl LLMBridge {
         }
     }
 
-    /// Exponential backoff with jitter.
+    /// Exponential backoff with full jitter.
+    ///
+    /// Full jitter uniformly samples the entire `[0, capped]` range rather
+    /// than adding a narrow band on top of the exponential value.  This
+    /// decorrelates competing callers far more effectively than additive
+    /// jitter (see AWS Architecture Blog, "Exponential Backoff And Jitter").
     fn calculate_backoff(&self, attempt: u32) -> u64 {
         let base = self.config.backoff_base_ms;
         let exponential = base.saturating_mul(2u64.pow(attempt));
         let capped = exponential.min(self.config.backoff_max_ms);
-        // Add 0-50% jitter (always positive to avoid underflow)
-        let jitter_range = capped / 2;
-        let jitter = if jitter_range > 0 {
-            rand::random::<u64>() % jitter_range
+        // Full jitter: spread across entire [0, capped] range
+        if capped > 0 {
+            rand::random::<u64>() % (capped + 1)
         } else {
             0
-        };
-        capped.saturating_add(jitter)
+        }
     }
 }

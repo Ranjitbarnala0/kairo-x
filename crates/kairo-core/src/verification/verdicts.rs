@@ -86,7 +86,7 @@ impl OverallVerdict {
         match self {
             Self::Pass => LLMVerdict::Pass,
             Self::Fail => LLMVerdict::Fail,
-            Self::Unavailable => LLMVerdict::Skipped,
+            Self::Unavailable => LLMVerdict::Unavailable,
         }
     }
 }

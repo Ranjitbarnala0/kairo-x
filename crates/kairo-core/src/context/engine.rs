@@ -122,19 +122,20 @@ impl ContextEngine {
 
     /// Update the import graph for a single file that was just written/modified.
     ///
-    /// Note: this borrows the file cache to build the known-files list for
-    /// import resolution without cloning all file contents.  Only file paths
-    /// are cloned (needed for the `resolve_import_path` lifetime), and we
-    /// clone the single target file's content to avoid a double borrow.
+    /// Borrows the file cache to build the known-files list for import
+    /// resolution. Only file paths are cloned (needed for the
+    /// `resolve_import_path` lifetime); content strings are NOT cloned since
+    /// `resolve_import_path` only inspects paths. The target file's content
+    /// is cloned once to break the shared borrow on `self.file_cache`.
     pub fn update_import_graph_for_file(&mut self, path: &str) {
         if let Some(content) = self.file_cache.get(path).cloned() {
-            // Build a lightweight view: we only need (path, content) refs for
-            // resolve_import_path, but the current API takes owned Strings.
-            // Clone just the paths, referencing the existing content strings.
+            // resolve_import_path only uses the path component of each pair;
+            // the content field is never read. Pass empty strings to avoid
+            // cloning every file's content.
             let files: Vec<(String, String)> = self
                 .file_cache
-                .iter()
-                .map(|(p, c)| (p.clone(), c.clone()))
+                .keys()
+                .map(|p| (p.clone(), String::new()))
                 .collect();
 
             self.import_graph.update_file(path, &content, &files, fnv_hash);
@@ -236,10 +237,8 @@ impl ContextEngine {
         node_idx: u32,
         arena: &Arena,
     ) -> Result<Vec<ContextCandidate>, ContextError> {
-        let node = arena.get(node_idx);
-        if node.status == crate::arena::node::NodeStatus::Deallocated {
-            return Err(ContextError::NodeNotFound(node_idx));
-        }
+        let node = arena.get(node_idx)
+            .ok_or(ContextError::NodeNotFound(node_idx))?;
 
         let spec = arena.get_spec(node_idx).unwrap_or("");
 
@@ -472,7 +471,10 @@ impl ContextEngine {
 
         // ---- Source 7: Dependency node outputs ----
         for &dep_idx in &node.dependencies {
-            let dep_node = arena.get(dep_idx);
+            let dep_node = match arena.get(dep_idx) {
+                Some(n) => n,
+                None => continue,
+            };
             if dep_node.status == crate::arena::node::NodeStatus::Verified {
                 // Include the dependency's implementation files
                 for &file_hash in &dep_node.impl_files {
@@ -581,9 +583,10 @@ impl ContextEngine {
             .any(|&th| self.import_graph.imports_of(th).contains(&candidate_hash));
 
         // imports_target: this candidate imports any target file
-        let imports_target = target_hashes
-            .iter()
-            .any(|&th| self.import_graph.importers_of(th).contains(&candidate_hash));
+        let imports_target = {
+            let candidate_imports = self.import_graph.imports_of(candidate_hash);
+            target_hashes.iter().any(|th| candidate_imports.contains(th))
+        };
 
         // same_language
         let same_language = target_paths
@@ -597,7 +600,8 @@ impl ContextEngine {
         // related_test
         let related_test = is_test_file(candidate_path);
 
-        // similar_name
+        // similar_name: require minimum stem length to avoid spurious substring
+        // matches on short names like "a", "io", "db", etc.
         let similar_name = target_paths.iter().any(|tp| {
             let target_stem = Path::new(tp)
                 .file_stem()
@@ -607,9 +611,10 @@ impl ContextEngine {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            !target_stem.is_empty()
-                && !candidate_stem.is_empty()
-                && (target_stem.contains(candidate_stem) || candidate_stem.contains(target_stem))
+            if candidate_stem.len() < 3 || target_stem.len() < 3 {
+                return false; // too short for substring matching
+            }
+            target_stem.contains(candidate_stem) || candidate_stem.contains(target_stem)
         });
 
         // type_definition
@@ -668,46 +673,86 @@ fn compute_fingerprint(packed: &PackedContext) -> u64 {
 
 /// Check if a file is a type definition file based on its name/extension.
 fn is_type_definition_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
+    let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
     // TypeScript declaration files
-    lower.ends_with(".d.ts")
-        // Common naming patterns
-        || lower.contains("types.")
-        || lower.contains("type.")
-        || lower.contains("interfaces.")
-        || lower.contains("models.")
+    filename.ends_with(".d.ts")
+        // Common naming patterns (matched against filename only)
+        || filename.starts_with("types.")
+        || filename.starts_with("type.")
+        || filename == "types" // extensionless
+        || filename.starts_with("interfaces.")
+        || filename.starts_with("models.")
         // C/C++ headers (often contain type definitions)
-        || lower.ends_with(".h")
-        || lower.ends_with(".hpp")
-        || lower.ends_with(".hxx")
+        || filename.ends_with(".h")
+        || filename.ends_with(".hpp")
+        || filename.ends_with(".hxx")
         // Python type stubs
-        || lower.ends_with(".pyi")
+        || filename.ends_with(".pyi")
 }
 
 /// Heuristic check of file content for type definition patterns.
+///
+/// Uses line-start matching to avoid false positives from comments, strings,
+/// or variable names that happen to contain keywords like "type" or "class".
 fn content_has_type_definitions(content: &str, path: &str) -> bool {
     let lang = Language::from_path(path);
     match lang {
         Language::TypeScript | Language::JavaScript => {
-            content.contains("interface ") || content.contains("type ") || content.contains("enum ")
+            content.lines().any(|line| {
+                let t = line.trim_start();
+                t.starts_with("interface ")
+                    || t.starts_with("export interface ")
+                    || t.starts_with("type ")
+                    || t.starts_with("export type ")
+                    || t.starts_with("enum ")
+                    || t.starts_with("export enum ")
+            })
         }
         Language::Rust => {
-            content.contains("pub struct ") || content.contains("pub enum ") || content.contains("pub trait ")
+            content.lines().any(|line| {
+                let t = line.trim_start();
+                t.starts_with("pub struct ")
+                    || t.starts_with("pub enum ")
+                    || t.starts_with("pub trait ")
+                    || t.starts_with("struct ")
+                    || t.starts_with("enum ")
+                    || t.starts_with("trait ")
+            })
         }
         Language::Python => {
-            content.contains("class ") && content.contains(":")
+            content.lines().any(|line| {
+                let t = line.trim_start();
+                // Top-level or indented class definitions
+                t.starts_with("class ") && t.contains(':')
+            })
         }
         Language::Go => {
-            content.contains("type ") && content.contains("struct {")
+            content.lines().any(|line| {
+                let t = line.trim_start();
+                t.starts_with("type ") && (t.contains("struct {") || t.contains("interface {"))
+            })
         }
         _ => false,
     }
 }
 
 /// Check if a file path looks like a test file.
+///
+/// Uses word-boundary-aware matching on the filename to avoid false positives
+/// (e.g. "contest.rs" or "spectral.ts" should not match).
 fn is_test_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.contains("test") || lower.contains("spec") || lower.contains("_test.") || lower.ends_with("_test.go")
+    let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    // Check common test file naming patterns
+    filename.starts_with("test_") || filename.starts_with("test.")
+        || filename.ends_with("_test.") || filename.contains("_test.")
+        || filename.ends_with(".test.") || filename.contains(".test.")
+        || filename.starts_with("spec_") || filename.starts_with("spec.")
+        || filename.ends_with("_spec.") || filename.contains("_spec.")
+        || filename.ends_with(".spec.") || filename.contains(".spec.")
+        // Also check directory components for test directories
+        || path.contains("/test/") || path.contains("/tests/")
+        || path.contains("/spec/") || path.contains("/specs/")
+        || path.contains("/__tests__/") || path.contains("/__test__/")
 }
 
 /// Find test files related to a given implementation file.
@@ -1107,7 +1152,7 @@ mod tests {
         // Create dependency node (database)
         let dep_node = Node::new("Database layer".to_string(), Priority::Critical);
         let dep_idx = arena.alloc(dep_node);
-        arena.get_mut(dep_idx).impl_files.push(dep_file_hash);
+        arena.get_mut(dep_idx).expect("just-allocated node").impl_files.push(dep_file_hash);
         arena.set_spec(dep_idx, "Implement the database connection layer.".to_string());
         arena.mark_complete(dep_idx);
 
@@ -1116,7 +1161,7 @@ mod tests {
         main_node.impl_files.push(main_file_hash);
         let main_idx = arena.alloc(main_node);
         arena.set_spec(main_idx, "Implement the service using the database.".to_string());
-        arena.add_dependency(main_idx, dep_idx);
+        arena.add_dependency(main_idx, dep_idx).expect("no cycle in test setup");
 
         let (packed, _) = engine.assemble_context(main_idx, &arena, None).unwrap();
 

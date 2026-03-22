@@ -38,6 +38,7 @@ use kairo_llm::call::{self, LLMCallType, Message};
 use kairo_llm::context_request;
 use kairo_llm::response::{ContextRequestKind, ResponseClass};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -79,11 +80,17 @@ pub enum RuntimeError {
     #[error("Node not found: {0}")]
     NodeNotFound(u32),
 
+    #[error("Arena error: {0}")]
+    Arena(#[from] crate::arena::ArenaError),
+
     #[error("LLM response contained no code implementation")]
     NoImplementation,
 
     #[error("File locked by another track, re-read needed: {0}")]
     FileLockedReRead(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -152,35 +159,81 @@ pub struct RuntimeConfig {
 /// Complete runtime state for the KAIRO-X agent.
 pub struct Runtime {
     /// The execution graph.
-    pub arena: Arena,
+    pub(crate) arena: Arena,
     /// Project fingerprint.
-    pub fingerprint: ProjectFingerprint,
+    pub(crate) fingerprint: ProjectFingerprint,
     /// Session manager.
-    pub session_manager: SessionManager,
+    pub(crate) session_manager: SessionManager,
     /// Token and cost tracker.
-    pub token_tracker: TokenTracker,
+    pub(crate) token_tracker: TokenTracker,
     /// Compliance tracker (rolling LLM response quality).
-    pub compliance: ComplianceTracker,
+    pub(crate) compliance: ComplianceTracker,
     /// Parallel execution scheduler.
-    pub scheduler: ParallelScheduler,
+    pub(crate) scheduler: ParallelScheduler,
     /// Per-file write locks for parallel safety.
-    pub file_locks: FileLockTable,
+    pub(crate) file_locks: FileLockTable,
     /// File snapshot store for rollback.
-    pub snapshots: SnapshotStore,
+    pub(crate) snapshots: SnapshotStore,
     /// Checkpoint manager.
-    pub checkpoint_manager: CheckpointManager,
+    pub(crate) checkpoint_manager: CheckpointManager,
     /// LLM bridge (provider communication).
-    pub bridge: LLMBridge,
+    pub(crate) bridge: LLMBridge,
     /// Neural controller for enforcement intensity adjustment.
-    pub controller: Controller,
+    pub(crate) controller: Controller,
     /// Runtime configuration.
-    pub config: RuntimeConfig,
+    pub(crate) config: RuntimeConfig,
     /// Count of nodes that passed on first implementation attempt.
-    pub first_pass_count: usize,
+    pub(crate) first_pass_count: usize,
     /// Count of nodes that required fixes.
-    pub fix_count: usize,
+    pub(crate) fix_count: usize,
     /// Count of nodes that required decomposition.
-    pub decompose_count: usize,
+    pub(crate) decompose_count: usize,
+}
+
+impl Runtime {
+    /// Restore internal state from a checkpoint. Used by the CLI resume flow.
+    pub fn restore_checkpoint_state(
+        &mut self,
+        arena: Arena,
+        token_tracker: TokenTracker,
+        compliance: ComplianceTracker,
+        controller_state: &[f32],
+        session_snapshot: Option<crate::session::manager::SessionManagerSnapshot>,
+    ) {
+        self.arena = arena;
+        self.token_tracker = token_tracker;
+        self.compliance = compliance;
+        if !controller_state.is_empty() {
+            let ok = self.controller.deserialize_state(controller_state);
+            if ok {
+                tracing::info!("Controller recurrent state restored");
+            }
+        }
+        if let Some(snapshot) = session_snapshot {
+            self.session_manager.restore_from_snapshot(snapshot);
+            tracing::info!("Session summaries restored");
+        }
+    }
+
+    /// Read-only access to the token tracker for display purposes.
+    pub fn token_tracker(&self) -> &TokenTracker {
+        &self.token_tracker
+    }
+
+    /// Read-only access to the arena for status queries.
+    pub fn arena(&self) -> &Arena {
+        &self.arena
+    }
+
+    /// Read-only access to the project fingerprint.
+    pub fn fingerprint(&self) -> &ProjectFingerprint {
+        &self.fingerprint
+    }
+
+    /// Read-only access to the runtime configuration.
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +516,7 @@ impl Runtime {
             }
             for &plan_idx in &summary.node_indices {
                 for &pre_idx in &prereq_indices {
-                    self.arena.add_dependency(plan_idx, pre_idx);
+                    self.arena.add_dependency(plan_idx, pre_idx)?;
                 }
             }
             summary.total_components += prereqs.len();
@@ -497,11 +550,11 @@ impl Runtime {
             return Err(RuntimeError::NodeNotFound(node_idx));
         }
 
-        self.arena.get_mut(node_idx).status = NodeStatus::Implementing;
-        self.arena.advance_step();
+        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::Implementing;
+        self.arena.advance_step()?;
 
-        let title = self.arena.get(node_idx).title.to_string();
-        let priority = self.arena.get(node_idx).priority;
+        let title = self.arena.get(node_idx).expect("node must exist").title.to_string();
+        let priority = self.arena.get(node_idx).expect("node must exist").priority;
         let spec = self.arena.get_spec(node_idx).unwrap_or("").to_string();
 
         tracing::info!(node = node_idx, title = %title, "Executing node");
@@ -509,13 +562,14 @@ impl Runtime {
         let (tpl, intensity) = self.select_enforcement(LLMCallType::Implement, priority);
         let enforcement = tpl.render(intensity);
 
-        let (session_id, is_new) = self.session_manager.get_or_create_session(
-            node_idx, 0, LLMCallType::Implement,
-        );
-
         let model = self.active_model();
         let max_out = self.active_max_output();
         let ctx = self.build_node_context(node_idx);
+        let context_fp = xxhash_rust::xxh3::xxh3_64(ctx.as_bytes());
+
+        let (session_id, is_new) = self.session_manager.get_or_create_session(
+            node_idx, context_fp, LLMCallType::Implement,
+        );
 
         let mut request = call::assemble_call(
             LLMCallType::Implement, &title, &spec,
@@ -541,15 +595,18 @@ impl Runtime {
         let mut ctx_rounds = 0u32;
         let mut previously_requested: Vec<String> = Vec::new();
         let response = loop {
-            let result = self.bridge.call(req.clone()).await?;
+            let result = match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(req.clone())).await {
+                Ok(r) => r?,
+                Err(_) => return Err(RuntimeError::Timeout("LLM call timed out after 5 minutes".into())),
+            };
             match result {
                 BridgeCallResult::Success(resp) => {
-                    self.record_call(node_idx, &resp);
+                    self.record_call(node_idx, &resp, LLMCallType::Implement);
                     break resp;
                 }
                 BridgeCallResult::NeedsContext { requests, raw_response } => {
                     ctx_rounds += 1;
-                    self.record_call(node_idx, &raw_response);
+                    self.record_call(node_idx, &raw_response, LLMCallType::Implement);
 
                     // Hard circuit breaker: max 3 rounds
                     if ctx_rounds > 3 {
@@ -560,8 +617,10 @@ impl Runtime {
                             "This is all the context available. Write the code with what you have. Do not request more context.".to_string()
                         ));
                         // One final attempt with no more context requests honored
-                        if let Ok(BridgeCallResult::Success(final_resp)) = self.bridge.call(req.clone()).await {
-                            self.record_call(node_idx, &final_resp);
+                        if let Ok(Ok(BridgeCallResult::Success(final_resp))) =
+                            tokio::time::timeout(Duration::from_secs(300), self.bridge.call(req.clone())).await
+                        {
+                            self.record_call(node_idx, &final_resp, LLMCallType::Implement);
                             break final_resp;
                         }
                         break raw_response;
@@ -591,8 +650,10 @@ impl Runtime {
                         req.messages.push(Message::user(
                             "The files you requested do not exist. Proceed with the code using the context already provided. Do not request more context.".to_string()
                         ));
-                        if let Ok(BridgeCallResult::Success(final_resp)) = self.bridge.call(req.clone()).await {
-                            self.record_call(node_idx, &final_resp);
+                        if let Ok(Ok(BridgeCallResult::Success(final_resp))) =
+                            tokio::time::timeout(Duration::from_secs(300), self.bridge.call(req.clone())).await
+                        {
+                            self.record_call(node_idx, &final_resp, LLMCallType::Implement);
                             break final_resp;
                         }
                         break raw_response;
@@ -604,21 +665,21 @@ impl Runtime {
                     req.messages.push(Message::user(injection));
                 }
                 BridgeCallResult::NeedsDecomposition(resp) => {
-                    self.record_call(node_idx, &resp);
+                    self.record_call(node_idx, &resp, LLMCallType::Implement);
                     tracing::info!(node = node_idx, "Node needs decomposition");
                     return self.decompose_node(node_idx).await;
                 }
             }
         };
 
-        let class = classify_response(&response.content, LLMCallType::Implement);
+        let class = classify_response(&response.content, LLMCallType::Implement, None);
         self.record_compliance(class.class);
 
         match class.class {
             ResponseClass::Implementation => {
-                match self.apply_implementation(node_idx, &response.content, track_id) {
+                match self.apply_implementation(node_idx, &response.content, track_id).await {
                     Ok(()) => {
-                        self.arena.get_mut(node_idx).status = NodeStatus::AwaitingVerification;
+                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::AwaitingVerification;
                         self.session_manager.record_good_response(node_idx);
                         Ok(NodeOutcome::Implemented)
                     }
@@ -642,12 +703,12 @@ impl Runtime {
                             LLMCallType::Implement, &title, &spec,
                             &ctx, "", &no_code_prompt, true, &model, max_out,
                         );
-                        match self.bridge.call(retry_req).await? {
-                            BridgeCallResult::Success(retry_resp) => {
-                                self.record_call(node_idx, &retry_resp);
-                                match self.apply_implementation(node_idx, &retry_resp.content, track_id) {
+                        match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(retry_req)).await {
+                            Ok(Ok(BridgeCallResult::Success(retry_resp))) => {
+                                self.record_call(node_idx, &retry_resp, LLMCallType::Implement);
+                                match self.apply_implementation(node_idx, &retry_resp.content, track_id).await {
                                     Ok(()) => {
-                                        self.arena.get_mut(node_idx).status = NodeStatus::AwaitingVerification;
+                                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::AwaitingVerification;
                                         Ok(NodeOutcome::Implemented)
                                     }
                                     Err(RuntimeError::NoImplementation) => {
@@ -656,24 +717,24 @@ impl Runtime {
                                             node = node_idx,
                                             "Second attempt also contained no code — marking node failed"
                                         );
-                                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                                         Ok(NodeOutcome::NoCode)
                                     }
                                     Err(e) => {
-                                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                                         Ok(NodeOutcome::Failed(format!("Edit after no-code retry: {e}")))
                                     }
                                 }
                             }
                             _ => {
-                                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                                 Ok(NodeOutcome::NoCode)
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(node = node_idx, error = %e, "Edit application failed");
-                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                         self.session_manager.record_bad_response(node_idx);
                         Ok(NodeOutcome::Failed(format!("Edit failed: {e}")))
                     }
@@ -689,35 +750,37 @@ impl Runtime {
                     LLMCallType::Implement, &title, &spec,
                     &ctx, "", &strong, true, &model, max_out,
                 );
-                match self.bridge.call(retry_req).await? {
-                    BridgeCallResult::Success(resp) => {
-                        self.record_call(node_idx, &resp);
-                        let rc = classify_response(&resp.content, LLMCallType::Implement);
+                match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(retry_req)).await {
+                    Ok(Ok(BridgeCallResult::Success(resp))) => {
+                        self.record_call(node_idx, &resp, LLMCallType::Implement);
+                        let rc = classify_response(&resp.content, LLMCallType::Implement, None);
                         self.record_compliance(rc.class);
                         if rc.class == ResponseClass::Implementation {
-                            match self.apply_implementation(node_idx, &resp.content, track_id) {
+                            match self.apply_implementation(node_idx, &resp.content, track_id).await {
                                 Ok(()) => {
-                                    self.arena.get_mut(node_idx).status = NodeStatus::AwaitingVerification;
+                                    self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::AwaitingVerification;
                                     return Ok(NodeOutcome::Implemented);
                                 }
                                 Err(e) => {
-                                    self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                                    self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                                     return Ok(NodeOutcome::Failed(format!("Edit after retry: {e}")));
                                 }
                             }
                         }
-                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                         Ok(NodeOutcome::Failed(format!("Still {:?} after escalation", rc.class)))
                     }
+                    Ok(Err(e)) => return Err(RuntimeError::Bridge(e)),
+                    Err(_) => return Err(RuntimeError::Timeout("LLM call timed out after 5 minutes".into())),
                     _ => {
-                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                         Ok(NodeOutcome::Failed("Retry produced non-success".to_string()))
                     }
                 }
             }
             other => {
                 self.session_manager.record_bad_response(node_idx);
-                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                 Ok(NodeOutcome::Failed(format!("Unexpected response class: {other:?}")))
             }
         }
@@ -734,14 +797,16 @@ impl Runtime {
         &mut self,
         node_idx: u32,
     ) -> Result<VerifyOutcome, RuntimeError> {
-        let priority = self.arena.get(node_idx).priority;
-        let title = self.arena.get(node_idx).title.to_string();
+        let node = self.arena.get(node_idx)
+            .ok_or(RuntimeError::NodeNotFound(node_idx))?;
+        let priority = node.priority;
+        let title = node.title.to_string();
         let spec = self.arena.get_spec(node_idx).unwrap_or("").to_string();
 
         tracing::info!(node = node_idx, title = %title, "Verifying node");
 
         // --- L1: Deterministic -----------------------------------------------
-        self.arena.get_mut(node_idx).status = NodeStatus::VerifyingDeterministic;
+        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::VerifyingDeterministic;
 
         if self.fingerprint.can_verify_deterministically() {
             let verifier = DeterministicVerifier::default();
@@ -757,22 +822,22 @@ impl Runtime {
                     .collect();
                 let details_str = details.join("\n");
                 tracing::warn!(node = node_idx, "L1 failed");
-                self.arena.get_mut(node_idx).det_verdict =
+                self.arena.get_mut(node_idx).expect("node must exist").det_verdict =
                     crate::arena::node::DeterministicVerdict::Fail;
-                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                 return Ok(VerifyOutcome::DeterministicFail { details: details_str });
             }
-            self.arena.get_mut(node_idx).det_verdict =
+            self.arena.get_mut(node_idx).expect("node must exist").det_verdict =
                 crate::arena::node::DeterministicVerdict::Pass;
         } else {
-            self.arena.get_mut(node_idx).det_verdict =
+            self.arena.get_mut(node_idx).expect("node must exist").det_verdict =
                 crate::arena::node::DeterministicVerdict::Unavailable;
         }
 
         // --- L2: LLM Audit (if required) ------------------------------------
         let runner = VerificationRunner::new(self.config.cost_mode);
         if runner.should_run_l2(priority) {
-            self.arena.get_mut(node_idx).status = NodeStatus::VerifyingAudit;
+            self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::VerifyingAudit;
             tracing::info!(node = node_idx, "Running L2 audit");
 
             let impl_content = self.build_node_context(node_idx);
@@ -786,29 +851,31 @@ impl Runtime {
                 &impl_content, "", &aenf, true, &model, max_out,
             );
 
-            match self.bridge.call_audit(audit_req).await? {
-                BridgeCallResult::Success(resp) => {
-                    self.record_call(node_idx, &resp);
-                    let ac = classify_response(&resp.content, LLMCallType::Audit);
+            match tokio::time::timeout(Duration::from_secs(300), self.bridge.call_audit(audit_req)).await {
+                Ok(Ok(BridgeCallResult::Success(resp))) => {
+                    self.record_call(node_idx, &resp, LLMCallType::Verify);
+                    let ac = classify_response(&resp.content, LLMCallType::Audit, None);
                     self.record_compliance(ac.class);
 
                     if ac.class == ResponseClass::VerificationFail {
                         let issues = LlmAuditor::parse_issues(&resp.content);
-                        self.arena.get_mut(node_idx).llm_verdict =
+                        self.arena.get_mut(node_idx).expect("node must exist").llm_verdict =
                             crate::arena::node::LLMVerdict::Fail;
-                        self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                         return Ok(VerifyOutcome::AuditFail { issues });
                     }
-                    self.arena.get_mut(node_idx).llm_verdict =
+                    self.arena.get_mut(node_idx).expect("node must exist").llm_verdict =
                         crate::arena::node::LLMVerdict::Pass;
                 }
+                Ok(Err(e)) => return Err(RuntimeError::Bridge(e)),
+                Err(_) => return Err(RuntimeError::Timeout("LLM audit timed out after 5 minutes".into())),
                 _ => {
-                    self.arena.get_mut(node_idx).llm_verdict =
+                    self.arena.get_mut(node_idx).expect("node must exist").llm_verdict =
                         crate::arena::node::LLMVerdict::Skipped;
                 }
             }
         } else {
-            self.arena.get_mut(node_idx).llm_verdict =
+            self.arena.get_mut(node_idx).expect("node must exist").llm_verdict =
                 crate::arena::node::LLMVerdict::Skipped;
         }
 
@@ -816,7 +883,7 @@ impl Runtime {
         self.arena.mark_complete(node_idx);
 
         // Discard file snapshots (no longer needed for rollback)
-        let file_hashes: Vec<u64> = self.arena.get(node_idx).impl_files.iter().copied().collect();
+        let file_hashes: Vec<u64> = self.arena.get(node_idx).expect("node must exist").impl_files.iter().copied().collect();
         for fh in file_hashes {
             if let Some(ps) = self.arena.resolve_file_path(fh) {
                 self.snapshots.discard(Path::new(ps));
@@ -840,25 +907,29 @@ impl Runtime {
         issues: &str,
         track_id: TrackId,
     ) -> Result<(), RuntimeError> {
-        let title = self.arena.get(node_idx).title.to_string();
-        let priority = self.arena.get(node_idx).priority;
+        let node = self.arena.get(node_idx)
+            .ok_or(RuntimeError::NodeNotFound(node_idx))?;
+        let title = node.title.to_string();
+        let priority = node.priority;
         let spec = self.arena.get_spec(node_idx).unwrap_or("").to_string();
 
-        self.arena.get_mut(node_idx).status = NodeStatus::Fixing;
-        self.arena.advance_step();
+        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::Fixing;
+        self.arena.advance_step()?;
         tracing::info!(node = node_idx, title = %title, "Fixing node");
 
         let (tpl, intensity) = self.select_enforcement(LLMCallType::Fix, priority);
         let enforcement = tpl.render(intensity);
 
-        let (sid, is_new) = self.session_manager.get_or_create_session(
-            node_idx, 0, LLMCallType::Fix,
-        );
-
         let model = self.active_model();
         let max_out = self.active_max_output();
         let fix_spec = format!(
             "{spec}\n\nVerification found these issues:\n{issues}\n\nFix all of them."
+        );
+        let fix_ctx = self.build_node_context(node_idx);
+        let context_fp = xxhash_rust::xxh3::xxh3_64(fix_ctx.as_bytes());
+
+        let (sid, is_new) = self.session_manager.get_or_create_session(
+            node_idx, context_fp, LLMCallType::Fix,
         );
 
         let mut req = call::assemble_call(
@@ -878,39 +949,42 @@ impl Runtime {
             }
         }
 
-        match self.bridge.call(req).await? {
-            BridgeCallResult::Success(resp) => {
-                self.record_call(node_idx, &resp);
-                let fc = classify_response(&resp.content, LLMCallType::Fix);
+        match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(req)).await {
+            Ok(Ok(BridgeCallResult::Success(resp))) => {
+                self.record_call(node_idx, &resp, LLMCallType::Fix);
+                let fc = classify_response(&resp.content, LLMCallType::Fix, None);
                 self.record_compliance(fc.class);
                 if fc.class == ResponseClass::Implementation || fc.class == ResponseClass::Plan {
                     // In fix context, NoImplementation is tolerable — treat as
                     // still needing fix rather than hard error.
-                    match self.apply_implementation(node_idx, &resp.content, track_id) {
+                    match self.apply_implementation(node_idx, &resp.content, track_id).await {
                         Ok(()) => {}
                         Err(RuntimeError::NoImplementation) => {
                             tracing::warn!(node = node_idx, "Fix response had no code");
                             self.session_manager.record_bad_response(node_idx);
-                            self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
-                            self.arena.get_mut(node_idx).retry_count += 1;
+                            self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
+                            self.arena.get_mut(node_idx).expect("node must exist").retry_count += 1;
                             return Ok(());
                         }
                         Err(e) => {
                             return Err(RuntimeError::EditFailed(format!("fix edit: {e}")));
                         }
                     }
-                    self.arena.get_mut(node_idx).status = NodeStatus::AwaitingVerification;
+                    self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::AwaitingVerification;
                     self.session_manager.record_good_response(node_idx);
                 } else {
                     self.session_manager.record_bad_response(node_idx);
-                    self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                    self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
+                    self.arena.get_mut(node_idx).expect("node must exist").retry_count += 1;
                 }
             }
+            Ok(Err(e)) => return Err(RuntimeError::Bridge(e)),
+            Err(_) => return Err(RuntimeError::Timeout("LLM fix call timed out after 5 minutes".into())),
             _ => {
-                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").retry_count += 1;
             }
         }
-        self.arena.get_mut(node_idx).retry_count += 1;
         Ok(())
     }
 }
@@ -955,7 +1029,7 @@ impl Runtime {
                 }
             };
 
-            let node_status = self.arena.get(node_idx).status;
+            let node_status = self.arena.get(node_idx).expect("node must exist").status;
             match node_status {
                 NodeStatus::Pending | NodeStatus::Ready => {
                     let outcome = self.execute_node(node_idx, 0).await?;
@@ -989,7 +1063,7 @@ impl Runtime {
                     self.fix_node(node_idx, &issues, 0).await?;
                     self.fix_count += 1;
 
-                    if self.arena.get(node_idx).status == NodeStatus::AwaitingVerification {
+                    if self.arena.get(node_idx).expect("node must exist").status == NodeStatus::AwaitingVerification {
                         let vr = self.verify_node(node_idx).await?;
                         match vr {
                             VerifyOutcome::Pass | VerifyOutcome::Skipped => {}
@@ -1038,6 +1112,7 @@ impl Runtime {
     async fn run_loop_parallel(&mut self) -> Result<TaskCompletionSummary, RuntimeError> {
         let max_tracks = self.scheduler.max_tracks;
         tracing::info!(tracks = max_tracks, "Starting execution loop (parallel)");
+        let mut consecutive_no_progress: u32 = 0;
 
         loop {
             // ----- Termination checks ------------------------------------------
@@ -1068,7 +1143,7 @@ impl Runtime {
                     tracing::info!(
                         track = track_id,
                         node = node_idx,
-                        title = %self.arena.get(node_idx).title,
+                        title = %self.arena.get(node_idx).expect("node must exist").title,
                         "Assigned node to track"
                     );
                     // Acquire file locks for this track's node
@@ -1119,7 +1194,7 @@ impl Runtime {
                             }
                             NodeOutcome::NoCode | NodeOutcome::ContextProvided | NodeOutcome::Failed(_) => {
                                 self.handle_exec_fail(node_idx).await?;
-                                if self.arena.get(node_idx).status == NodeStatus::Failed {
+                                if self.arena.get(node_idx).expect("node must exist").status == NodeStatus::Failed {
                                     self.scheduler.release_track(tid, &self.file_locks);
                                 } else {
                                     // Node can retry — transition to Fixing
@@ -1157,7 +1232,7 @@ impl Runtime {
                                         "Deterministic verification failed"
                                     );
                                     self.handle_verify_fail(node_idx, &details).await?;
-                                    if self.arena.get(node_idx).status == NodeStatus::Failed {
+                                    if self.arena.get(node_idx).expect("node must exist").status == NodeStatus::Failed {
                                         self.scheduler.release_track(tid, &self.file_locks);
                                     } else {
                                         // Transition to Fixing
@@ -1172,7 +1247,7 @@ impl Runtime {
                                     );
                                     let joined = issues.join("\n");
                                     self.handle_verify_fail(node_idx, &joined).await?;
-                                    if self.arena.get(node_idx).status == NodeStatus::Failed {
+                                    if self.arena.get(node_idx).expect("node must exist").status == NodeStatus::Failed {
                                         self.scheduler.release_track(tid, &self.file_locks);
                                     } else {
                                         self.scheduler.track_mut(tid).state =
@@ -1190,10 +1265,10 @@ impl Runtime {
                         self.fix_node(node_idx, &issues, tid).await?;
                         self.fix_count += 1;
 
-                        if self.arena.get(node_idx).status == NodeStatus::AwaitingVerification {
+                        if self.arena.get(node_idx).expect("node must exist").status == NodeStatus::AwaitingVerification {
                             // Re-enqueue for verification
                             self.scheduler.enqueue_verification(tid);
-                        } else if !self.arena.get(node_idx).can_retry() {
+                        } else if !self.arena.get(node_idx).expect("node must exist").can_retry() {
                             // Max retries exhausted
                             self.arena.mark_failed(node_idx);
                             self.scheduler.release_track(tid, &self.file_locks);
@@ -1240,6 +1315,25 @@ impl Runtime {
             }
 
             // ----- Phase 4: Check if we're stuck or done -----------------------
+            // Track consecutive iterations with no progress for deadlock detection.
+            if any_progress || assigned_any {
+                consecutive_no_progress = 0;
+            } else {
+                consecutive_no_progress += 1;
+                if consecutive_no_progress >= 100 {
+                    self.file_locks.clear();
+                    let st = self.status();
+                    tracing::error!(
+                        iterations = consecutive_no_progress,
+                        pending = st.pending,
+                        active = st.active,
+                        fix_needed = st.fix_needed,
+                        "Deadlock detected: 100 consecutive iterations with no progress"
+                    );
+                    return Err(RuntimeError::AllNodesFailed { failed: st.failed + st.pending });
+                }
+            }
+
             let active_tracks = self.scheduler.active_track_count();
             let st = self.status();
 
@@ -1284,7 +1378,7 @@ impl Runtime {
 
     /// Acquire file locks for all files associated with a node.
     fn acquire_node_file_locks(&self, node_idx: u32, track_id: u8) {
-        for &fh in &self.arena.get(node_idx).impl_files {
+        for &fh in &self.arena.get(node_idx).expect("node must exist").impl_files {
             if let Some(path_str) = self.arena.resolve_file_path(fh) {
                 let path = Path::new(path_str);
                 let _ = self.file_locks.acquire(path, track_id);
@@ -1294,16 +1388,18 @@ impl Runtime {
 
     /// Get resolved file paths for a node.
     fn get_node_file_paths(&self, node_idx: u32) -> Vec<PathBuf> {
-        self.arena
-            .get(node_idx)
-            .impl_files
-            .iter()
-            .filter_map(|&fh| {
-                self.arena
-                    .resolve_file_path(fh)
-                    .map(PathBuf::from)
-            })
-            .collect()
+        match self.arena.get(node_idx) {
+            Some(node) => node
+                .impl_files
+                .iter()
+                .filter_map(|&fh| {
+                    self.arena
+                        .resolve_file_path(fh)
+                        .map(PathBuf::from)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Assign fix-needed and awaiting-verification nodes to idle tracks.
@@ -1318,7 +1414,7 @@ impl Runtime {
             .nodes_needing_fix()
             .into_iter()
             .filter(|&idx| {
-                self.arena.get(idx).can_retry()
+                self.arena.get(idx).map_or(false, |n| n.can_retry())
                     && !self.is_node_on_any_track(idx)
             })
             .collect();
@@ -1331,7 +1427,7 @@ impl Runtime {
                     self.scheduler.track_mut(tid).assign(node_idx, 0);
                     self.scheduler.track_mut(tid).state =
                         crate::parallel::TrackState::Fixing;
-                    self.arena.get_mut(node_idx).status = NodeStatus::Fixing;
+                    self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::Fixing;
                     self.acquire_node_file_locks(node_idx, tid);
                     tracing::info!(
                         track = tid, node = node_idx,
@@ -1412,17 +1508,18 @@ impl Runtime {
 
         // Slots 6-9: Active node context
         if active_node > 0 && (active_node as usize) < self.arena.nodes.len() {
-            let node = self.arena.get(active_node);
-            let s = packet.slot_mut(slots::ACTIVE_NODE.start);
-            encode_priority(s, node.priority, 0);
-            encode_node_status(s, node.status, 3);
-            encode_count(&mut s[15..], node.retry_count as u32, node.max_retries as u32);
-            encode_count(&mut s[19..], node.llm_calls_spent as u32, 20);
-            encode_count(&mut s[23..], node.dependencies.len() as u32, 16);
-            let resolved = node.dependencies.iter()
-                .filter(|&&d| self.arena.get(d).status == NodeStatus::Verified)
-                .count();
-            encode_count(&mut s[27..], resolved as u32, node.dependencies.len().max(1) as u32);
+            if let Some(node) = self.arena.get(active_node) {
+                let s = packet.slot_mut(slots::ACTIVE_NODE.start);
+                encode_priority(s, node.priority, 0);
+                encode_node_status(s, node.status, 3);
+                encode_count(&mut s[15..], node.retry_count as u32, node.max_retries as u32);
+                encode_count(&mut s[19..], node.llm_calls_spent as u32, 20);
+                encode_count(&mut s[23..], node.dependencies.len() as u32, 16);
+                let resolved = node.dependencies.iter()
+                    .filter(|&&d| self.arena.get(d).map_or(false, |n| n.status == NodeStatus::Verified))
+                    .count();
+                encode_count(&mut s[27..], resolved as u32, node.dependencies.len().max(1) as u32);
+            }
         }
 
         // Slots 25-26: Itch state
@@ -1445,7 +1542,7 @@ impl Runtime {
             let s = packet.slot_mut(slots::COST_STATE.start);
             let bl = self.token_tracker.cost_limit_microdollars;
             if bl > 0 {
-                encode_float(s, self.token_tracker.cost_budget_remaining() as f32 / bl as f32, 0);
+                encode_float(s, self.token_tracker.cost_budget_remaining().unwrap_or(0) as f32 / bl as f32, 0);
             }
             let cm = match self.config.cost_mode {
                 CostMode::Thorough => 0, CostMode::Balanced => 1, CostMode::Efficient => 2,
@@ -1472,14 +1569,14 @@ impl Runtime {
     ///
     /// In sequential mode (`max_parallel_tracks <= 1`), writes directly without
     /// locking overhead. In parallel mode, acquires the file lock via the
-    /// `FileLockTable`'s synchronous acquire, retrying every 500ms for up to
+    /// `FileLockTable`'s acquire, retrying every 500ms for up to
     /// 5 seconds. If still blocked, returns `RuntimeError::FileLockedReRead`
     /// so the caller can re-read and retry.
     ///
     /// On success the lock is *kept* (not released) so the track retains
     /// exclusive access until `release_track` or `release_all` is called.
     /// The file path is also registered in the node's `impl_files`.
-    fn write_file_locked_sync(
+    async fn write_file_locked(
         &mut self,
         path: &Path,
         content: &str,
@@ -1488,20 +1585,20 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         if !self.is_parallel() {
             // Sequential mode — write directly.
-            crate::tools::filesystem::write_file(path, content)
+            crate::tools::filesystem::write_file(path, content, &self.config.project_root)
                 .map_err(|e| RuntimeError::EditFailed(format!("write {}: {e}", path.display())))?;
         } else {
-            // Parallel mode — acquire lock with synchronous retry.
+            // Parallel mode — acquire lock with async retry.
             let start = std::time::Instant::now();
-            let max_wait = std::time::Duration::from_secs(5);
-            let retry_interval = std::time::Duration::from_millis(500);
+            let max_wait = Duration::from_secs(5);
+            let retry_interval = Duration::from_millis(500);
 
             loop {
                 match self.file_locks.acquire(path, track_id) {
                     crate::tools::file_locks::LockResult::Acquired
                     | crate::tools::file_locks::LockResult::AlreadyOwned => {
                         // We hold the lock — write the file.
-                        crate::tools::filesystem::write_file(path, content)
+                        crate::tools::filesystem::write_file(path, content, &self.config.project_root)
                             .map_err(|e| RuntimeError::EditFailed(
                                 format!("write {}: {e}", path.display())
                             ))?;
@@ -1518,7 +1615,7 @@ impl Runtime {
                                 elapsed.as_millis()
                             )));
                         }
-                        std::thread::sleep(retry_interval.min(max_wait.saturating_sub(elapsed)));
+                        tokio::time::sleep(retry_interval.min(max_wait.saturating_sub(elapsed))).await;
                     }
                 }
             }
@@ -1527,8 +1624,8 @@ impl Runtime {
         // Register the file path in the node's impl_files.
         let path_str = path.to_string_lossy().to_string();
         let fh = self.arena.register_file_path(&path_str);
-        if !self.arena.get(node_idx).impl_files.contains(&fh) {
-            self.arena.get_mut(node_idx).impl_files.push(fh);
+        if !self.arena.get(node_idx).expect("node must exist").impl_files.contains(&fh) {
+            self.arena.get_mut(node_idx).expect("node must exist").impl_files.push(fh);
         }
 
         Ok(())
@@ -1546,7 +1643,10 @@ impl Runtime {
         request: &call::LLMRequest,
         node_idx: u32,
     ) -> Result<String, RuntimeError> {
-        let result = self.bridge.call(request.clone()).await?;
+        let result = match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(request.clone())).await {
+            Ok(r) => r?,
+            Err(_) => return Err(RuntimeError::Timeout("LLM call timed out after 5 minutes".into())),
+        };
         match result {
             BridgeCallResult::Success(r) => {
                 self.token_tracker.record_usage(node_idx, r.input_tokens, r.output_tokens);
@@ -1565,11 +1665,12 @@ impl Runtime {
         &mut self,
         node_idx: u32,
         resp: &kairo_llm::response::LLMRawResponse,
+        call_type: LLMCallType,
     ) {
-        self.arena.get_mut(node_idx).record_llm_call();
+        self.arena.get_mut(node_idx).expect("node must exist").record_llm_call();
         self.token_tracker.record_usage(node_idx, resp.input_tokens, resp.output_tokens);
         if let Some(session) = self.session_manager.get_session_for_node_mut(node_idx) {
-            session.record_usage(resp.input_tokens, resp.output_tokens, LLMCallType::Implement);
+            session.record_usage(resp.input_tokens, resp.output_tokens, call_type);
             // Store the assistant response so future session continuations
             // replay the full conversation history.
             session.messages.push(Message::assistant(resp.content.clone()));
@@ -1583,7 +1684,7 @@ impl Runtime {
     fn pick_next_node(&mut self) -> Option<u32> {
         // 1. Fix-needed nodes that can still retry
         for idx in self.arena.nodes_needing_fix() {
-            if self.arena.get(idx).can_retry() {
+            if self.arena.get(idx).map_or(false, |n| n.can_retry()) {
                 return Some(idx);
             }
         }
@@ -1594,10 +1695,10 @@ impl Runtime {
         }
         // 3. Pop from pending queue (skip stale entries)
         while let Some(entry) = self.arena.pending_queue.pop() {
-            let n = self.arena.get(entry.node_idx);
-            if n.status == NodeStatus::Pending
-                && self.arena.are_dependencies_resolved(entry.node_idx)
-            {
+            let is_ready = self.arena.get(entry.node_idx)
+                .map_or(false, |n| n.status == NodeStatus::Pending)
+                && self.arena.are_dependencies_resolved(entry.node_idx);
+            if is_ready {
                 return Some(entry.node_idx);
             }
         }
@@ -1611,11 +1712,13 @@ impl Runtime {
         node_idx: u32,
         _issues: &str,
     ) -> Result<(), RuntimeError> {
-        if self.arena.get(node_idx).can_retry() {
-            self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+        let node = self.arena.get(node_idx)
+            .ok_or(RuntimeError::NodeNotFound(node_idx))?;
+        if node.can_retry() {
+            self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
         } else {
             // Restore file snapshots
-            let file_hashes: Vec<u64> = self.arena.get(node_idx).impl_files.iter().copied().collect();
+            let file_hashes: Vec<u64> = self.arena.get(node_idx).expect("node must exist").impl_files.iter().copied().collect();
             for fh in file_hashes {
                 if let Some(ps) = self.arena.resolve_file_path(fh) {
                     let _ = self.snapshots.restore_file(Path::new(ps));
@@ -1631,7 +1734,10 @@ impl Runtime {
         &mut self,
         node_idx: u32,
     ) -> Result<(), RuntimeError> {
-        if !self.arena.get(node_idx).can_retry() {
+        let can_retry = self.arena.get(node_idx)
+            .ok_or(RuntimeError::NodeNotFound(node_idx))?
+            .can_retry();
+        if !can_retry {
             self.arena.mark_failed(node_idx);
         }
         Ok(())
@@ -1644,9 +1750,9 @@ impl Runtime {
     /// SEARCH/REPLACE blocks and no file creation markers (explanation-only).
     ///
     /// `track_id` is the parallel track executing this node (0 in sequential mode).
-    /// All filesystem writes go through `write_file_locked_sync` to ensure proper
+    /// All filesystem writes go through `write_file_locked` to ensure proper
     /// lock acquisition in parallel mode.
-    fn apply_implementation(
+    async fn apply_implementation(
         &mut self,
         node_idx: u32,
         content: &str,
@@ -1661,12 +1767,12 @@ impl Runtime {
                 for (path, file_content) in files {
                     let full = project_root.join(&path);
                     let _ = self.snapshots.snapshot_file(&full);
-                    self.write_file_locked_sync(&full, &file_content, node_idx, track_id)?;
+                    self.write_file_locked(&full, &file_content, node_idx, track_id).await?;
                     tracing::info!(path = %path, "Created new file");
                 }
                 return Ok(());
             }
-            // FIX #2: No files written, no edits — this is an explanation-only response.
+            // No files written, no edits — this is an explanation-only response.
             return Err(RuntimeError::NoImplementation);
         }
 
@@ -1674,13 +1780,13 @@ impl Runtime {
         let mut files_written = false;
 
         // Determine target files
-        let impl_files: Vec<String> = self.arena.get(node_idx).impl_files.iter()
+        let impl_files: Vec<String> = self.arena.get(node_idx).expect("node must exist").impl_files.iter()
             .filter_map(|&h| self.arena.resolve_file_path(h).map(|s| s.to_string()))
             .collect();
 
         if impl_files.len() == 1 {
             let fpath = project_root.join(&impl_files[0]);
-            self.apply_edits_to_file(&fpath, &blocks, node_idx, track_id)?;
+            self.apply_edits_to_file(&fpath, &blocks, node_idx, track_id).await?;
             return Ok(());
         }
 
@@ -1688,21 +1794,36 @@ impl Runtime {
         for f in &impl_files {
             let fpath = project_root.join(f);
             if fpath.exists()
-                && self.apply_edits_to_file(&fpath, &blocks, node_idx, track_id).is_ok()
+                && self.apply_edits_to_file(&fpath, &blocks, node_idx, track_id).await.is_ok()
             {
                 return Ok(());
             }
         }
 
-        // Broad search fallback
+        // Broad search fallback — check file lock ownership before writing.
+        // If the file is locked by another track, skip it to avoid cross-track conflicts.
         for block in &blocks {
             let needle = &block.search[..block.search.len().min(80)];
-            if let Ok(matches) = crate::tools::filesystem::search_text(&project_root, needle, 3) {
+            if let Ok(matches) = crate::tools::filesystem::search_text(&project_root, needle, 3, &self.config.project_root) {
                 if let Some(m) = matches.first() {
+                    // Check file lock ownership: skip if locked by another track
+                    if self.is_parallel() {
+                        if let Some(holder) = self.file_locks.held_by(&m.path) {
+                            if holder != track_id {
+                                tracing::warn!(
+                                    path = %m.path.display(),
+                                    holder = holder,
+                                    track = track_id,
+                                    "Broad search fallback: file locked by another track, skipping"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let _ = self.snapshots.snapshot_file(&m.path);
-                    if let Ok(c) = crate::tools::filesystem::read_file(&m.path) {
+                    if let Ok(c) = crate::tools::filesystem::read_file(&m.path, &self.config.project_root) {
                         if let Ok((nc, _)) = crate::tools::search_replace::apply_edits(&c, std::slice::from_ref(block)) {
-                            self.write_file_locked_sync(&m.path, &nc, node_idx, track_id)?;
+                            self.write_file_locked(&m.path, &nc, node_idx, track_id).await?;
                             files_written = true;
                         }
                     }
@@ -1718,8 +1839,8 @@ impl Runtime {
 
     /// Apply search/replace blocks to a single file.
     ///
-    /// All writes go through `write_file_locked_sync` for parallel safety.
-    fn apply_edits_to_file(
+    /// All writes go through `write_file_locked` for parallel safety.
+    async fn apply_edits_to_file(
         &mut self,
         file_path: &Path,
         blocks: &[crate::tools::search_replace::SearchReplaceBlock],
@@ -1728,14 +1849,14 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let _ = self.snapshots.snapshot_file(file_path);
         let content = if file_path.exists() {
-            crate::tools::filesystem::read_file(file_path)
+            crate::tools::filesystem::read_file(file_path, &self.config.project_root)
                 .map_err(|e| RuntimeError::EditFailed(format!("read {}: {e}", file_path.display())))?
         } else {
             String::new()
         };
         let (new_content, apps) = crate::tools::search_replace::apply_edits(&content, blocks)
             .map_err(|e| RuntimeError::EditFailed(format!("edit {}: {e}", file_path.display())))?;
-        self.write_file_locked_sync(file_path, &new_content, node_idx, track_id)?;
+        self.write_file_locked(file_path, &new_content, node_idx, track_id).await?;
         tracing::info!(path = %file_path.display(), edits = apps.len(), "Applied edits");
         Ok(())
     }
@@ -1744,10 +1865,10 @@ impl Runtime {
     fn build_node_context(&self, node_idx: u32) -> String {
         let root = &self.config.project_root;
         let mut parts = Vec::new();
-        for &fh in &self.arena.get(node_idx).impl_files {
+        for &fh in &self.arena.get(node_idx).expect("node must exist").impl_files {
             if let Some(ps) = self.arena.resolve_file_path(fh) {
                 let full = root.join(ps);
-                if let Ok(c) = crate::tools::filesystem::read_file(&full) {
+                if let Ok(c) = crate::tools::filesystem::read_file(&full, &self.config.project_root) {
                     parts.push(format!("--- {ps} ---\n{c}"));
                 }
             }
@@ -1757,7 +1878,10 @@ impl Runtime {
 
     /// Get issues description for a node that needs fixing.
     fn get_node_issues(&self, node_idx: u32) -> String {
-        let node = self.arena.get(node_idx);
+        let node = match self.arena.get(node_idx) {
+            Some(n) => n,
+            None => return "Node not found.".to_string(),
+        };
         let mut parts = Vec::new();
         if node.det_verdict == crate::arena::node::DeterministicVerdict::Fail {
             parts.push("Deterministic verification (build/test/lint) failed.".to_string());
@@ -1777,11 +1901,13 @@ impl Runtime {
         &mut self,
         node_idx: u32,
     ) -> Result<NodeOutcome, RuntimeError> {
-        let title = self.arena.get(node_idx).title.to_string();
+        let node = self.arena.get(node_idx)
+            .ok_or(RuntimeError::NodeNotFound(node_idx))?;
+        let title = node.title.to_string();
         let spec = self.arena.get_spec(node_idx).unwrap_or("").to_string();
-        let priority = self.arena.get(node_idx).priority;
+        let priority = node.priority;
 
-        self.arena.get_mut(node_idx).status = NodeStatus::Decomposing;
+        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::Decomposing;
 
         let (tpl, int) = self.select_enforcement(LLMCallType::Decompose, priority);
         let enf = tpl.render(int);
@@ -1792,10 +1918,12 @@ impl Runtime {
             LLMCallType::Decompose, &title, &spec,
             "", "", &enf, true, &model, max_out,
         );
-        let decompose_text = match self.bridge.call(req).await? {
-            BridgeCallResult::Success(r) => { self.record_call(node_idx, &r); r.content }
+        let decompose_text = match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(req)).await {
+            Ok(Ok(BridgeCallResult::Success(r))) => { self.record_call(node_idx, &r, LLMCallType::Decompose); r.content }
+            Ok(Err(e)) => return Err(RuntimeError::Bridge(e)),
+            Err(_) => return Err(RuntimeError::Timeout("LLM decompose call timed out after 5 minutes".into())),
             _ => {
-                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                 return Ok(NodeOutcome::Failed("Decomposition failed".into()));
             }
         };
@@ -1811,10 +1939,12 @@ impl Runtime {
             model, temperature: 0.0, max_output_tokens: max_out,
             call_type: LLMCallType::Decompose, stop_sequences: Vec::new(),
         };
-        let json_text = match self.bridge.call(json_req).await? {
-            BridgeCallResult::Success(r) => { self.record_call(node_idx, &r); r.content }
+        let json_text = match tokio::time::timeout(Duration::from_secs(300), self.bridge.call(json_req)).await {
+            Ok(Ok(BridgeCallResult::Success(r))) => { self.record_call(node_idx, &r, LLMCallType::Decompose); r.content }
+            Ok(Err(e)) => return Err(RuntimeError::Bridge(e)),
+            Err(_) => return Err(RuntimeError::Timeout("LLM decompose JSON timed out after 5 minutes".into())),
             _ => {
-                self.arena.get_mut(node_idx).status = NodeStatus::FixNeeded;
+                self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::FixNeeded;
                 return Ok(NodeOutcome::Failed("Decompose JSON failed".into()));
             }
         };
@@ -1825,7 +1955,12 @@ impl Runtime {
 
         let sub = plan_parser::build_graph_from_plan(&mut self.arena, &components, node_idx)
             .map_err(|e| RuntimeError::Planning(e.to_string()))?;
-        self.arena.mark_complete(node_idx);
+        // Don't mark the parent as Verified — it was decomposed, not completed.
+        // Leave it in Decomposing status and clear its itch bit so the system
+        // can terminate once all sub-nodes are done. The sub-nodes carry their
+        // own itch bits and will be processed independently.
+        self.arena.get_mut(node_idx).expect("node must exist").status = NodeStatus::Decomposing;
+        self.arena.itch.clear(node_idx as usize);
         Ok(NodeOutcome::Decomposed { sub_node_count: sub.total_components })
     }
 
@@ -1842,7 +1977,7 @@ impl Runtime {
             match &req.kind {
                 ContextRequestKind::File { path, line_start, line_end } => {
                     let full = root.join(path);
-                    match crate::tools::filesystem::read_file(&full) {
+                    match crate::tools::filesystem::read_file(&full, root) {
                         Ok(c) => {
                             let c = match (line_start, line_end) {
                                 (Some(s), Some(e)) => c.lines()
@@ -1855,14 +1990,14 @@ impl Runtime {
                         }
                         Err(_) => {
                             let dir = full.parent().unwrap_or(root);
-                            let alts: Vec<String> = crate::tools::filesystem::list_directory(dir)
+                            let alts: Vec<String> = crate::tools::filesystem::list_directory(dir, root)
                                 .unwrap_or_default().iter().take(10).map(|e| e.name.clone()).collect();
                             not_found.push((req.clone(), alts));
                         }
                     }
                 }
                 ContextRequestKind::Symbol { name } => {
-                    match crate::tools::filesystem::search_text(root, name, 5) {
+                    match crate::tools::filesystem::search_text(root, name, 5, root) {
                         Ok(ms) if !ms.is_empty() => {
                             let c = ms.iter().map(|m| format!("{}:{}: {}", m.path.display(), m.line_number, m.line))
                                 .collect::<Vec<_>>().join("\n");
@@ -1954,7 +2089,7 @@ impl std::fmt::Display for TaskCompletionSummary {
         writeln!(f, "Task complete. {}", self.status)?;
         writeln!(f, "  LLM calls: {}", self.total_llm_calls)?;
         writeln!(f, "  Tokens: {} in / {} out", self.total_input_tokens, self.total_output_tokens)?;
-        let cost = self.estimated_cost_microdollars as f64 / 100_000_000.0;
+        let cost = self.estimated_cost_microdollars as f64 / 1_000_000.0;
         writeln!(f, "  Estimated cost: ${cost:.2}")?;
         if self.first_pass_success > 0 {
             writeln!(f, "  First-pass success: {}", self.first_pass_success)?;

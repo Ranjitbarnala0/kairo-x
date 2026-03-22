@@ -145,6 +145,24 @@ impl Controller {
             );
         }
 
+        // Output normalization — matches Python: x = self.output_norm(x)
+        // Applied after all liquid blocks, before the heads.
+        {
+            let out_norm_w = self.weights.get_or_zeros(
+                "output_norm.weight",
+                &[self.config.d_model],
+            );
+            let out_norm_b = self.weights.get_or_zeros(
+                "output_norm.bias",
+                &[self.config.d_model],
+            );
+            liquid_block::apply_layer_norm(
+                &mut current,
+                &out_norm_w.data,
+                &out_norm_b.data,
+            );
+        }
+
         // Compute output heads from final representation
         let head_outputs = heads::compute_heads(
             &current,

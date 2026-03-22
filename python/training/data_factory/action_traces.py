@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -108,10 +108,13 @@ class ActionSequenceTrace:
     enforcement_labels: torch.Tensor    # (seq_len, 1) float
     stop_labels: torch.Tensor           # (seq_len,) int64
     itch_active: torch.Tensor           # (seq_len,) bool
-    seq_length: int                     # Actual length (before padding)
+    seq_length: Any                     # int for single trace, (batch,) int64 tensor after collation
 
     def to(self, device: torch.device) -> "ActionSequenceTrace":
         """Move all tensors to device."""
+        sl = self.seq_length
+        if isinstance(sl, torch.Tensor):
+            sl = sl.to(device)
         return ActionSequenceTrace(
             input_slots=self.input_slots.to(device),
             context_candidates=self.context_candidates.to(device),
@@ -120,7 +123,7 @@ class ActionSequenceTrace:
             enforcement_labels=self.enforcement_labels.to(device),
             stop_labels=self.stop_labels.to(device),
             itch_active=self.itch_active.to(device),
-            seq_length=self.seq_length,
+            seq_length=sl,
         )
 
 
@@ -377,7 +380,11 @@ class ActionTraceDataset(Dataset):
 
 
 def collate_action_sequences(batch: List[ActionSequenceTrace]) -> ActionSequenceTrace:
-    """Collate a list of ActionSequenceTrace into a batched version."""
+    """Collate a list of ActionSequenceTrace into a batched version.
+
+    seq_length becomes a per-sample int64 tensor of shape (batch,) so that
+    sequence masks can be built correctly per sample in the loss and eval code.
+    """
     return ActionSequenceTrace(
         input_slots=torch.stack([t.input_slots for t in batch]),
         context_candidates=torch.stack([t.context_candidates for t in batch]),
@@ -386,5 +393,5 @@ def collate_action_sequences(batch: List[ActionSequenceTrace]) -> ActionSequence
         enforcement_labels=torch.stack([t.enforcement_labels for t in batch]),
         stop_labels=torch.stack([t.stop_labels for t in batch]),
         itch_active=torch.stack([t.itch_active for t in batch]),
-        seq_length=max(t.seq_length for t in batch),
+        seq_length=torch.tensor([t.seq_length for t in batch], dtype=torch.int64),
     )

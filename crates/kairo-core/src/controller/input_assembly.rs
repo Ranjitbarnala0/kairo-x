@@ -37,13 +37,31 @@ impl InputPacket {
     }
 
     /// Get a mutable slice for a specific slot.
+    ///
+    /// # Panics
+    /// Panics with a descriptive message if `slot_idx >= N_INPUT_SLOTS`.
     pub fn slot_mut(&mut self, slot_idx: usize) -> &mut [f32] {
+        assert!(
+            slot_idx < N_INPUT_SLOTS,
+            "slot index {} out of range [0, {})",
+            slot_idx,
+            N_INPUT_SLOTS,
+        );
         let start = slot_idx * D_MODEL;
         &mut self.data[start..start + D_MODEL]
     }
 
     /// Get an immutable slice for a specific slot.
+    ///
+    /// # Panics
+    /// Panics with a descriptive message if `slot_idx >= N_INPUT_SLOTS`.
     pub fn slot(&self, slot_idx: usize) -> &[f32] {
+        assert!(
+            slot_idx < N_INPUT_SLOTS,
+            "slot index {} out of range [0, {})",
+            slot_idx,
+            N_INPUT_SLOTS,
+        );
         let start = slot_idx * D_MODEL;
         &self.data[start..start + D_MODEL]
     }

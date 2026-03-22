@@ -8,6 +8,7 @@
 use crate::arena::Arena;
 use crate::arena::node::Node;
 use crate::itch::ItchRegister;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use thiserror::Error;
@@ -42,13 +43,17 @@ const FORMAT_VERSION: u32 = 1;
 /// Magic bytes to identify KAIRO arena files.
 const MAGIC: [u8; 4] = *b"KXAG"; // KAIRO-X Arena Graph
 
+/// Maximum data payload length for deserialization (256 MiB).
+/// Prevents allocating unbounded memory from corrupted/malicious data.
+const MAX_ARENA_DATA_LEN: usize = 256 * 1024 * 1024;
+
 /// Serializable snapshot of the full arena state.
 #[derive(Serialize, Deserialize)]
 struct ArenaSnapshot {
     version: u32,
     nodes: Vec<Node>,
     free_list: Vec<u32>,
-    title_index: Vec<(u64, u32)>,
+    title_index: Vec<(String, u32)>,
     path_index: Vec<(u64, Vec<u32>)>,
     itch_raw: Vec<u64>,
     itch_bit_len: usize,
@@ -70,7 +75,7 @@ impl Arena {
             version: FORMAT_VERSION,
             nodes: self.nodes.clone(),
             free_list: self.free_list.clone(),
-            title_index: self.title_index.iter().map(|(&k, &v)| (k, v)).collect(),
+            title_index: self.title_index.iter().map(|(k, &v)| (k.clone(), v)).collect(),
             path_index: self
                 .path_index
                 .iter()
@@ -130,7 +135,20 @@ impl Arena {
         // Read data length
         let mut len_bytes = [0u8; 8];
         reader.read_exact(&mut len_bytes)?;
-        let data_len = u64::from_le_bytes(len_bytes) as usize;
+        let data_len_u64 = u64::from_le_bytes(len_bytes);
+
+        // Guard against corrupted / malicious length fields that would cause
+        // a massive allocation and OOM. 256 MiB is generous for any legitimate
+        // arena -- the typical size is well under 1 MB.
+        if data_len_u64 > MAX_ARENA_DATA_LEN as u64 {
+            return Err(SerializeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "arena data length {data_len_u64} exceeds maximum allowed size ({MAX_ARENA_DATA_LEN} bytes)"
+                ),
+            )));
+        }
+        let data_len = data_len_u64 as usize;
 
         // Read data
         let mut data = vec![0u8; data_len];
@@ -150,8 +168,10 @@ impl Arena {
             });
         }
 
-        // Decode
-        let snapshot: ArenaSnapshot = bincode::deserialize(&data)?;
+        // Decode with size limit to prevent OOM from crafted payloads
+        let snapshot: ArenaSnapshot = bincode::DefaultOptions::new()
+            .with_limit(MAX_ARENA_DATA_LEN as u64)
+            .deserialize(&data)?;
 
         // Reconstruct arena
         let mut arena = Arena::new();
@@ -205,11 +225,11 @@ mod tests {
 
         let n1 = arena.alloc(Node::new("JWT Service".to_string(), Priority::Critical));
         let n2 = arena.alloc(Node::new("Auth Middleware".to_string(), Priority::Standard));
-        arena.add_dependency(n2, n1);
+        arena.add_dependency(n2, n1).expect("no cycle");
         arena.set_spec(n1, "Implement JWT token service with RS256".to_string());
 
         let file_hash = arena.register_file_path("src/auth/jwt.rs");
-        arena.get_mut(n1).impl_files.push(file_hash);
+        arena.get_mut(n1).expect("node must exist").impl_files.push(file_hash);
 
         // Serialize
         let bytes = arena.serialize_to_bytes().unwrap();
@@ -219,9 +239,9 @@ mod tests {
 
         // Verify
         assert_eq!(restored.live_count(), 2);
-        assert_eq!(restored.get(n1).title.as_str(), "JWT Service");
-        assert_eq!(restored.get(n2).title.as_str(), "Auth Middleware");
-        assert!(restored.get(n2).dependencies.contains(&n1));
+        assert_eq!(restored.get(n1).expect("node must exist").title.as_str(), "JWT Service");
+        assert_eq!(restored.get(n2).expect("node must exist").title.as_str(), "Auth Middleware");
+        assert!(restored.get(n2).expect("node must exist").dependencies.contains(&n1));
         assert_eq!(
             restored.get_spec(n1).unwrap(),
             "Implement JWT token service with RS256"

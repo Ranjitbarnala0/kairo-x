@@ -124,6 +124,15 @@ pub fn parse_plan_json(json_text: &str) -> Result<Vec<PlanComponent>, PlanParseE
             *in_degree.get_mut(&c.id).unwrap() = c.depends_on.len();
         }
 
+        // Build adjacency list: node_id -> list of dependents (O(n+e) instead of O(n*e))
+        let mut dependents: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        for c in &components {
+            for &dep in &c.depends_on {
+                dependents.entry(dep).or_default().push(c.id);
+            }
+        }
+
         let mut queue: std::collections::VecDeque<u32> = in_degree
             .iter()
             .filter(|(_, deg)| **deg == 0)
@@ -131,15 +140,15 @@ pub fn parse_plan_json(json_text: &str) -> Result<Vec<PlanComponent>, PlanParseE
             .collect();
         let mut visited_count = 0usize;
 
+        // Kahn's algorithm using the pre-built adjacency list
         while let Some(node) = queue.pop_front() {
             visited_count += 1;
-            // Find all components that depend on this node
-            for c in &components {
-                if c.depends_on.contains(&node) {
-                    let deg = in_degree.get_mut(&c.id).unwrap();
+            if let Some(deps) = dependents.get(&node) {
+                for &dependent in deps {
+                    let deg = in_degree.get_mut(&dependent).unwrap();
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(c.id);
+                        queue.push_back(dependent);
                     }
                 }
             }
@@ -187,29 +196,51 @@ fn extract_json_array(text: &str) -> &str {
     trimmed
 }
 
-/// Find the position of the matching closing bracket for a string starting with '['.
+/// Find the position of the matching closing bracket for a string starting with `[`.
+///
+/// Handles:
+/// - Nested brackets at arbitrary depth.
+/// - JSON string literals (double-quoted), including escaped quotes (`\"`).
+/// - Escaped backslashes inside strings (`\\`) so that `\\"` is correctly
+///   recognized as an escaped backslash followed by an unescaped quote.
+///
+/// Limitations:
+/// - Does not handle raw string literals from languages like Rust (`r#"..."#`)
+///   or Python (`r"..."`). Those are not valid JSON, so this is acceptable for
+///   LLM-generated JSON plans. If the `spec` field were to contain such content,
+///   the LLM's Pass 2 JSON serializer would have already escaped it.
+/// - Single-quoted strings are not treated as string delimiters (JSON only uses
+///   double quotes).
 fn find_matching_bracket(text: &str) -> Option<usize> {
-    let mut depth = 0;
+    let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
 
     for (i, ch) in text.char_indices() {
         if escaped {
+            // Previous character was an unescaped backslash inside a string.
+            // This character is consumed as part of the escape sequence
+            // regardless of what it is (handles \\, \", \n, \uXXXX, etc.).
             escaped = false;
             continue;
         }
-        if ch == '\\' && in_string {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
         if in_string {
+            match ch {
+                '\\' => {
+                    escaped = true;
+                }
+                '"' => {
+                    in_string = false;
+                }
+                _ => {}
+            }
             continue;
         }
+        // Outside a string
         match ch {
+            '"' => {
+                in_string = true;
+            }
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -248,7 +279,7 @@ pub fn parse_plan_numbered_list(text: &str) -> Result<Vec<PlanComponent>, PlanPa
         let trimmed = line.trim();
 
         // Check for numbered line: "1. Title..."
-        if let Some(rest) = try_parse_numbered_line(trimmed) {
+        if let Some((id, rest)) = try_parse_numbered_line(trimmed) {
             // Save previous component if any
             if current_id > 0 && !current_title.is_empty() {
                 components.push(PlanComponent {
@@ -260,7 +291,8 @@ pub fn parse_plan_numbered_list(text: &str) -> Result<Vec<PlanComponent>, PlanPa
                 });
             }
 
-            current_id = components.len() as u32 + 1;
+            // Use the actual number from the line as the component ID
+            current_id = id;
             current_title = rest.to_string();
             current_spec = String::new();
             current_deps = Vec::new();
@@ -298,8 +330,10 @@ pub fn parse_plan_numbered_list(text: &str) -> Result<Vec<PlanComponent>, PlanPa
     Ok(components)
 }
 
-/// Try to parse a line as "N. rest..." and return the rest.
-fn try_parse_numbered_line(line: &str) -> Option<&str> {
+/// Try to parse a line as "N. rest..." and return the parsed numeric ID and the rest.
+///
+/// Returns `Some((id, rest_of_line))` if the line matches `<digits>. <text>`.
+fn try_parse_numbered_line(line: &str) -> Option<(u32, &str)> {
     let mut chars = line.chars();
     let first = chars.next()?;
     if !first.is_ascii_digit() {
@@ -312,18 +346,31 @@ fn try_parse_numbered_line(line: &str) -> Option<&str> {
 
     // Verify everything before the dot is also digits
     if rest_str[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
-        Some(rest_str[dot_pos + 2..].trim())
+        // Extract the full number string: first digit + any remaining digits before the dot
+        let num_end = 1 + dot_pos; // 1 for `first` char + offset to dot in `rest_str`
+        let num_str = &line[..num_end];
+        let id = num_str.parse::<u32>().ok()?;
+        Some((id, rest_str[dot_pos + 2..].trim()))
     } else {
         None
     }
 }
 
 /// Extract dependency IDs from text like "(depends on 1, 3, 5)".
+///
+/// Only extracts digits found within the first matched pair of parentheses.
+/// This prevents stray digits in surrounding text (e.g., the component's own
+/// number prefix) from being misinterpreted as dependency IDs.
 fn extract_dependency_ids(text: &str) -> Vec<u32> {
-    text.chars()
-        .filter(|c| c.is_ascii_digit() || *c == ' ')
-        .collect::<String>()
-        .split_whitespace()
+    // Restrict extraction to the content between ( and )
+    let paren_content = if let (Some(start), Some(end)) = (text.find('('), text.rfind(')')) {
+        &text[start + 1..end]
+    } else {
+        text
+    };
+    paren_content
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<u32>().ok())
         .collect()
 }
@@ -375,7 +422,14 @@ pub fn build_graph_from_plan(
         let arena_idx = id_to_arena_idx[&component.id];
         for &dep_id in &component.depends_on {
             if let Some(&dep_arena_idx) = id_to_arena_idx.get(&dep_id) {
-                arena.add_dependency(arena_idx, dep_arena_idx);
+                // Ignore cyclic dependency errors during plan loading —
+                // the plan parser trusts the LLM output but logs warnings.
+                if let Err(e) = arena.add_dependency(arena_idx, dep_arena_idx) {
+                    tracing::warn!(
+                        node = arena_idx, dep = dep_arena_idx,
+                        "Skipping dependency: {e}"
+                    );
+                }
             }
         }
     }
@@ -384,7 +438,7 @@ pub fn build_graph_from_plan(
     for component in components {
         let arena_idx = id_to_arena_idx[&component.id];
         if arena.are_dependencies_resolved(arena_idx) {
-            let priority = arena.get(arena_idx).priority;
+            let priority = arena.get(arena_idx).expect("just-allocated node must exist").priority;
             arena.pending_queue.push(PendingEntry {
                 node_idx: arena_idx,
                 priority,
@@ -524,7 +578,7 @@ mod tests {
         // Second node should NOT be in pending queue (depends on first)
         let ready = arena.nodes_ready();
         assert_eq!(ready.len(), 1);
-        assert_eq!(arena.get(ready[0]).title.as_str(), "Auth");
+        assert_eq!(arena.get(ready[0]).expect("node must exist").title.as_str(), "Auth");
     }
 
     #[test]

@@ -95,18 +95,87 @@ pub enum ContextSource {
 }
 
 impl ContextSource {
-    /// Estimated token count for this context source (rough: 1 token ~ 4 chars).
+    /// Estimated token count for this context source.
+    ///
+    /// Delegates to [`candidates::estimate_tokens`] so that every call site
+    /// uses the same char-based formula (~3.5 chars per token).
     pub fn estimated_tokens(&self) -> u32 {
-        let chars = match self {
-            Self::File { content, .. } => content.len(),
-            Self::FileRange { content, .. } => content.len(),
-            Self::Symbol { definition, .. } => definition.len(),
-            Self::ProjectStructure { summary } => summary.len(),
-            Self::DependencyOutput { output_summary, .. } => output_summary.len(),
-            Self::TestOutput { output, .. } => output.len(),
-            Self::Diagnostic { message, .. } => message.len(),
+        candidates::estimate_tokens(self.content_str())
+    }
+
+    /// Return the primary text content of this source.
+    fn content_str(&self) -> &str {
+        match self {
+            Self::File { content, .. } => content.as_str(),
+            Self::FileRange { content, .. } => content.as_str(),
+            Self::Symbol { definition, .. } => definition.as_str(),
+            Self::ProjectStructure { summary } => summary.as_str(),
+            Self::DependencyOutput { output_summary, .. } => output_summary.as_str(),
+            Self::TestOutput { output, .. } => output.as_str(),
+            Self::Diagnostic { message, .. } => message.as_str(),
+        }
+    }
+
+    /// Return a copy of this source with its text content truncated to fit
+    /// approximately `max_tokens` tokens. Uses char-boundary-aware slicing
+    /// and breaks at the last newline for clean output.
+    pub fn truncate_to(&self, max_tokens: u32) -> Self {
+        let original = self.content_str();
+        let max_chars = (max_tokens as usize) * 4;
+        if original.len() <= max_chars {
+            return self.clone();
+        }
+        // Find a safe UTF-8 char boundary
+        let mut boundary = max_chars.min(original.len());
+        while boundary > 0 && !original.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let truncated = if boundary == 0 {
+            String::new()
+        } else {
+            let region = &original[..boundary];
+            if let Some(last_nl) = region.rfind('\n') {
+                format!(
+                    "{}\n// ... truncated ({} tokens estimated)",
+                    &original[..last_nl],
+                    max_tokens
+                )
+            } else {
+                format!("{}\n// ... truncated", &original[..boundary])
+            }
         };
-        (chars as u32 / 4).max(1)
+        match self {
+            Self::File { path, .. } => Self::File {
+                path: path.clone(),
+                content: truncated,
+            },
+            Self::FileRange { path, start_line, end_line, .. } => Self::FileRange {
+                path: path.clone(),
+                content: truncated,
+                start_line: *start_line,
+                end_line: *end_line,
+            },
+            Self::Symbol { name, file_path, .. } => Self::Symbol {
+                name: name.clone(),
+                definition: truncated,
+                file_path: file_path.clone(),
+            },
+            Self::ProjectStructure { .. } => Self::ProjectStructure {
+                summary: truncated,
+            },
+            Self::DependencyOutput { node_title, .. } => Self::DependencyOutput {
+                node_title: node_title.clone(),
+                output_summary: truncated,
+            },
+            Self::TestOutput { passed, .. } => Self::TestOutput {
+                output: truncated,
+                passed: *passed,
+            },
+            Self::Diagnostic { tool, .. } => Self::Diagnostic {
+                tool: tool.clone(),
+                message: truncated,
+            },
+        }
     }
 
     /// Human-readable label for this context source.
@@ -292,11 +361,20 @@ impl ContextBuilder {
         let mut total_tokens = 0u32;
         let mut was_trimmed = false;
 
-        for (source, _priority) in self.sources {
+        for (source, priority) in self.sources {
             let tokens = source.estimated_tokens();
             if total_tokens + tokens <= self.token_budget {
                 total_tokens += tokens;
                 included.push(source);
+            } else if matches!(priority, ContextPriority::Required) {
+                // Truncate required items to fit remaining budget instead of dropping
+                let remaining = self.token_budget.saturating_sub(total_tokens);
+                if remaining > 0 {
+                    let truncated = source.truncate_to(remaining);
+                    total_tokens += truncated.estimated_tokens();
+                    included.push(truncated);
+                    was_trimmed = true;
+                }
             } else {
                 was_trimmed = true;
             }

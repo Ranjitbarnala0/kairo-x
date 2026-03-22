@@ -34,7 +34,7 @@ pub struct TemplateSelection {
 /// | Call Type  | Critical       | Standard       | Mechanical     |
 /// |------------|----------------|----------------|----------------|
 /// | Plan       | Plan @ 0.9     | Plan @ 0.6     | Plan @ 0.3     |
-/// | Implement  | CriticalImpl   | StandardImpl   | None @ 0.0     |
+/// | Implement  | CriticalImpl   | StandardImpl   | StandardImpl@.15|
 /// | Verify     | Verification   | Verification   | Verification   |
 /// | Audit      | DeepAudit      | DeepAudit      | Verification   |
 /// | Fix        | Fix @ high     | Fix @ med      | Fix @ low      |
@@ -61,8 +61,8 @@ pub fn select_template(action: LLMCallType, priority: Priority) -> TemplateSelec
             intensity: base_intensity,
         },
         (LLMCallType::Implement, Priority::Mechanical) => TemplateSelection {
-            template: Template::None,
-            intensity: 0.0,
+            template: Template::StandardImpl,
+            intensity: 0.15,
         },
 
         // ----- Verify -----
@@ -190,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mechanical_impl_no_enforcement() {
+    fn test_mechanical_impl_baseline_enforcement() {
         let sel = select_template(LLMCallType::Implement, Priority::Mechanical);
-        assert_eq!(sel.template, Template::None);
-        assert!((sel.intensity - 0.0).abs() < f32::EPSILON);
+        assert_eq!(sel.template, Template::StandardImpl);
+        assert!((sel.intensity - 0.15).abs() < f32::EPSILON);
     }
 
     #[test]

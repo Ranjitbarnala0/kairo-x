@@ -77,7 +77,7 @@ pub struct NodeUsage {
     /// Total cost for this node in microdollars (1/1_000_000 of a dollar).
     pub cost_microdollars: u64,
     /// Number of LLM calls made for this node.
-    pub call_count: u16,
+    pub call_count: u32,
 }
 
 impl NodeUsage {
@@ -204,22 +204,22 @@ impl TokenTracker {
         self.total_cost_microdollars as f64 / 1_000_000.0
     }
 
-    /// Remaining cost budget in microdollars. Returns 0 if no cost budget is set.
-    pub fn cost_budget_remaining(&self) -> u64 {
+    /// Remaining cost budget in microdollars. Returns `None` if no cost budget
+    /// is set (unlimited).
+    pub fn cost_budget_remaining(&self) -> Option<u64> {
         if self.cost_limit_microdollars == 0 {
-            return 0; // unlimited
+            return None; // unlimited
         }
-        self.cost_limit_microdollars
-            .saturating_sub(self.total_cost_microdollars)
+        Some(self.cost_limit_microdollars.saturating_sub(self.total_cost_microdollars))
     }
 
-    /// Remaining token budget. Returns 0 if no token budget is set.
-    pub fn token_budget_remaining(&self) -> u64 {
+    /// Remaining token budget. Returns `None` if no token budget is set
+    /// (unlimited).
+    pub fn token_budget_remaining(&self) -> Option<u64> {
         if self.token_budget == 0 {
-            return 0; // unlimited
+            return None; // unlimited
         }
-        self.token_budget
-            .saturating_sub(self.total_input + self.total_output)
+        Some(self.token_budget.saturating_sub(self.total_input + self.total_output))
     }
 
     /// Whether either budget (cost or token) has been exhausted.
@@ -255,7 +255,7 @@ impl TokenTracker {
 
     /// Total tokens consumed (input + output).
     pub fn total_tokens(&self) -> u64 {
-        self.total_input + self.total_output
+        self.total_input.saturating_add(self.total_output)
     }
 
     /// Get usage for a specific node.
@@ -272,9 +272,12 @@ impl TokenTracker {
     }
 
     /// Update the cost rates (e.g., after provider failover to a different model).
+    ///
+    /// Rates are in **millidollars per million tokens** (same unit as the
+    /// constructor). They are converted to microdollars internally (* 1000).
     pub fn update_rates(&mut self, cost_per_input_mtok: u64, cost_per_output_mtok: u64) {
-        self.cost_per_input_mtok = cost_per_input_mtok;
-        self.cost_per_output_mtok = cost_per_output_mtok;
+        self.cost_per_input_mtok = cost_per_input_mtok * 1000;
+        self.cost_per_output_mtok = cost_per_output_mtok * 1000;
     }
 
     /// Generate a summary string for logging.
@@ -360,8 +363,8 @@ mod tests {
     fn test_budget_unlimited() {
         let tracker = TokenTracker::new(INPUT_RATE, OUTPUT_RATE, 0, 0, CostMode::Balanced);
         assert!(!tracker.is_budget_exhausted());
-        assert_eq!(tracker.cost_budget_remaining(), 0);
-        assert_eq!(tracker.token_budget_remaining(), 0);
+        assert!(tracker.cost_budget_remaining().is_none());
+        assert!(tracker.token_budget_remaining().is_none());
     }
 
     #[test]
@@ -390,8 +393,9 @@ mod tests {
         let mut tracker = TokenTracker::new(INPUT_RATE, OUTPUT_RATE, cost_budget, 0, CostMode::Balanced);
 
         tracker.record_usage(1, 100_000, 50_000);
-        assert!(tracker.cost_budget_remaining() > 0);
-        assert!(tracker.cost_budget_remaining() < cost_budget);
+        let remaining = tracker.cost_budget_remaining().expect("budget is set");
+        assert!(remaining > 0);
+        assert!(remaining < cost_budget);
     }
 
     #[test]
@@ -400,7 +404,7 @@ mod tests {
         let mut tracker = TokenTracker::new(INPUT_RATE, OUTPUT_RATE, 0, token_budget, CostMode::Balanced);
 
         tracker.record_usage(1, 100_000, 50_000);
-        assert_eq!(tracker.token_budget_remaining(), 850_000);
+        assert_eq!(tracker.token_budget_remaining(), Some(850_000));
     }
 
     #[test]
@@ -481,8 +485,8 @@ mod tests {
         tracker.record_usage(1, 1_000_000, 1_000_000);
         let cost_before = tracker.total_cost_microdollars;
 
-        // Change to cheaper rates (in microdollars — update_rates uses internal units)
-        tracker.update_rates(1_000_000, 5_000_000);
+        // Change to cheaper rates (in millidollars/Mtok — same unit as constructor)
+        tracker.update_rates(1_000, 5_000);
         tracker.record_usage(2, 1_000_000, 1_000_000);
 
         // Second call should be cheaper

@@ -25,16 +25,19 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
@@ -138,10 +141,13 @@ class Trainer:
         # Setup logging
         self._setup_logging()
 
-        # Set seed (offset per rank for data diversity)
-        torch.manual_seed(config.seed + self._rank)
+        # Set seed across all RNGs (offset per rank for data diversity)
+        seed = config.seed + self._rank
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.seed + self._rank)
+            torch.cuda.manual_seed_all(seed)
 
         # Device
         self.device = torch.device(config.device)
@@ -546,8 +552,12 @@ class Trainer:
             # Checkpointing (all ranks participate for barrier sync)
             if step % self.config.checkpoint_every_steps == 0:
                 self._save_checkpoint("latest")
-                if self._is_main and components.get("total", float("inf")) < self._best_loss:
-                    self._best_loss = components["total"]
+                # Use EMA of recent losses for best-model tracking to avoid
+                # saving on a single lucky batch
+                recent = self._train_losses[-100:]
+                ema_loss = sum(recent) / len(recent) if recent else float("inf")
+                if self._is_main and ema_loss < self._best_loss:
+                    self._best_loss = ema_loss
                     self._save_checkpoint("best")
 
             # Evaluation and phase gating (rank 0 evaluates, broadcasts decision)
@@ -623,21 +633,22 @@ class Trainer:
                 dist.destroy_process_group()
 
     def _export_final(self) -> None:
-        """Export the final trained model to binary format.
+        """Export the final trained model to manifest.json + weights.bin format.
 
         Uses the unwrapped model so DDP wrapper state is not included.
+        The export produces a directory containing manifest.json and weights.bin.
         """
-        export_path = os.path.join(self.config.export_dir, "kairo_controller.bin")
-        logger.info("Exporting final model to %s", export_path)
+        export_dir = os.path.join(self.config.export_dir, "kairo_controller")
+        logger.info("Exporting final model to %s", export_dir)
 
-        file_size = export_model(self._raw_model, export_path, self.config.model)
+        file_size = export_model(self._raw_model, export_dir, self.config.model)
         logger.info("Export complete: %.2f MB", file_size / (1024 * 1024))
 
         # Verify
-        if verify_export(self._raw_model, export_path):
+        if verify_export(self._raw_model, export_dir):
             logger.info("Export verification passed.")
         else:
-            logger.error("Export verification FAILED -- check binary output!")
+            logger.error("Export verification FAILED -- check export directory!")
 
     def resume(self, checkpoint_path: str) -> None:
         """

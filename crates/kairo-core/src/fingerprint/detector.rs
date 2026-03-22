@@ -338,13 +338,24 @@ fn walk_for_languages(
             continue;
         }
 
-        if path.is_dir() {
+        // Use symlink_metadata to avoid following symlinks. This prevents
+        // infinite loops on circular symlinks and avoids double-counting
+        // files that are symlinked from elsewhere in the tree.
+        let file_type = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m.file_type(),
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             // Skip known non-source directories
             if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
             walk_for_languages(&path, _root, counts, depth + 1);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if let Some(lang) = DetectedLanguage::from_extension(ext) {
                     *counts.entry(lang).or_insert(0) += 1;

@@ -18,6 +18,7 @@
 
 pub mod weights;
 pub mod input_assembly;
+pub(crate) mod math;
 pub mod liquid_block;
 pub mod heads;
 pub mod inference;

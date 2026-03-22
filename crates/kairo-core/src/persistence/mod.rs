@@ -24,11 +24,17 @@ use crate::enforcement::compliance::ComplianceTracker;
 use crate::session::manager::{SessionManager, SessionManagerSnapshot};
 use crate::session::token_tracker::TokenTracker;
 use crate::tools::snapshots::SnapshotStore;
+use bincode::Options;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64;
+
+/// Maximum size (in bytes) for bincode deserialization to prevent OOM from
+/// corrupted or malicious checkpoint data. 256 MB is generous enough for any
+/// legitimate KAIRO-X arena while still capping memory exposure.
+const MAX_DESERIALIZE_SIZE: u64 = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -54,14 +60,26 @@ pub enum PersistenceError {
 
     #[error("Corrupted checkpoint: {0}")]
     Corrupted(String),
+
+    #[error("Unsupported checkpoint format version {found} (expected {expected})")]
+    FormatVersionMismatch { expected: u32, found: u32 },
+
+    #[error("Symlink detected at {0}, refusing to delete")]
+    SymlinkRefused(PathBuf),
 }
 
 // ---------------------------------------------------------------------------
 // Checkpoint metadata
 // ---------------------------------------------------------------------------
 
+/// Current checkpoint format version. Bump this when the on-disk layout changes.
+const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMeta {
+    /// Checkpoint format version for forward-compatibility checks.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
     /// Step number at which this checkpoint was taken.
     pub step: u32,
     /// Timestamp of checkpoint creation.
@@ -78,6 +96,12 @@ pub struct CheckpointMeta {
     pub total_tokens: u64,
 }
 
+/// Default for `format_version` when deserializing old meta.json files that
+/// lack the field (pre-v1 checkpoints are implicitly version 0).
+fn default_format_version() -> u32 {
+    0
+}
+
 /// Serializable index of which files had snapshots at checkpoint time.
 ///
 /// We only persist the file paths (not the content, which is ephemeral
@@ -86,6 +110,21 @@ pub struct CheckpointMeta {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SnapshotIndex {
     pub paths: Vec<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Atomic file writes
+// ---------------------------------------------------------------------------
+
+/// Write `data` to `path` atomically via a temporary file + rename.
+///
+/// This guarantees that readers never see a half-written file: either the old
+/// content is present or the new content is, never a truncated intermediate.
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -141,39 +180,33 @@ impl CheckpointManager {
         let graph_bytes = arena.serialize_to_bytes().map_err(|e| {
             PersistenceError::Serialization(format!("Arena serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("graph.bin"), &graph_bytes)?;
 
         // Serialize itch register separately (for fast independent reads)
         let itch_data = bincode::serialize(&arena.itch).map_err(|e| {
             PersistenceError::Serialization(format!("Itch serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("itch.bin"), &itch_data)?;
 
         // Serialize token accounting
         let token_data = bincode::serialize(token_tracker).map_err(|e| {
             PersistenceError::Serialization(format!("Token tracker serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("token_accounting.bin"), &token_data)?;
 
         // Serialize compliance tracker
         let compliance_data = bincode::serialize(compliance).map_err(|e| {
             PersistenceError::Serialization(format!("Compliance serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("compliance.bin"), &compliance_data)?;
 
         // Serialize controller recurrent state
         let controller_state = controller.serialize_state();
         let controller_bytes = bincode::serialize(&controller_state).map_err(|e| {
             PersistenceError::Serialization(format!("Controller state serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("controller_state.bin"), &controller_bytes)?;
 
         // Serialize session summaries (metadata only, not message history)
         let session_snapshot = session_manager.snapshot();
         let sessions_bytes = bincode::serialize(&session_snapshot).map_err(|e| {
             PersistenceError::Serialization(format!("Sessions serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("sessions_summary.bin"), &sessions_bytes)?;
 
         // Serialize snapshot index (which files have snapshots)
         let snapshot_index = SnapshotIndex {
@@ -182,20 +215,33 @@ impl CheckpointManager {
         let snapshots_bytes = bincode::serialize(&snapshot_index).map_err(|e| {
             PersistenceError::Serialization(format!("Snapshot index serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("snapshots_index.bin"), &snapshots_bytes)?;
 
-        // Combined hash for integrity (over the core files that existed before)
+        // Combined hash for integrity: covers ALL serialized data.
         let mut combined = Vec::new();
         combined.extend_from_slice(&graph_bytes);
         combined.extend_from_slice(&itch_data);
         combined.extend_from_slice(&token_data);
         combined.extend_from_slice(&compliance_data);
+        combined.extend_from_slice(&controller_bytes);
+        combined.extend_from_slice(&sessions_bytes);
+        combined.extend_from_slice(&snapshots_bytes);
         let combined_hash = xxh3_64(&combined);
 
-        // Write metadata
+        // Write data files atomically (tmp + rename). Meta is written LAST so
+        // its presence serves as the commit marker for a complete checkpoint.
+        atomic_write(&checkpoint_dir.join("graph.bin"), &graph_bytes)?;
+        atomic_write(&checkpoint_dir.join("itch.bin"), &itch_data)?;
+        atomic_write(&checkpoint_dir.join("token_accounting.bin"), &token_data)?;
+        atomic_write(&checkpoint_dir.join("compliance.bin"), &compliance_data)?;
+        atomic_write(&checkpoint_dir.join("controller_state.bin"), &controller_bytes)?;
+        atomic_write(&checkpoint_dir.join("sessions_summary.bin"), &sessions_bytes)?;
+        atomic_write(&checkpoint_dir.join("snapshots_index.bin"), &snapshots_bytes)?;
+
+        // Write metadata LAST — its presence signals a complete checkpoint.
         let (_active_itch, _) = arena.itch_stats();
         let summary = arena.status_summary();
         let meta = CheckpointMeta {
+            format_version: CHECKPOINT_FORMAT_VERSION,
             step,
             timestamp: Utc::now(),
             combined_hash,
@@ -208,7 +254,7 @@ impl CheckpointManager {
         let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| {
             PersistenceError::Serialization(format!("Meta serialization failed: {e}"))
         })?;
-        std::fs::write(checkpoint_dir.join("meta.json"), meta_json)?;
+        atomic_write(&checkpoint_dir.join("meta.json"), meta_json.as_bytes())?;
 
         self.last_checkpoint_step = step;
 
@@ -244,18 +290,73 @@ impl CheckpointManager {
             PersistenceError::Corrupted(format!("Invalid meta.json: {e}"))
         })?;
 
-        // Read and verify all data
+        // Check format version — reject unknown future versions.
+        if meta.format_version > CHECKPOINT_FORMAT_VERSION {
+            return Err(PersistenceError::FormatVersionMismatch {
+                expected: CHECKPOINT_FORMAT_VERSION,
+                found: meta.format_version,
+            });
+        }
+
+        let deserializer = bincode::DefaultOptions::new()
+            .with_limit(MAX_DESERIALIZE_SIZE);
+
+        // Read core data files
         let graph_bytes = std::fs::read(checkpoint_dir.join("graph.bin"))?;
         let itch_data = std::fs::read(checkpoint_dir.join("itch.bin"))?;
         let token_data = std::fs::read(checkpoint_dir.join("token_accounting.bin"))?;
         let compliance_data = std::fs::read(checkpoint_dir.join("compliance.bin"))?;
 
-        // Verify integrity
+        // Read additional files (backward-compat: may be absent in v0 checkpoints)
+        let controller_data = {
+            let path = checkpoint_dir.join("controller_state.bin");
+            if path.exists() {
+                Some(std::fs::read(&path)?)
+            } else {
+                tracing::debug!("controller_state.bin not found (old checkpoint format)");
+                None
+            }
+        };
+
+        let sessions_data = {
+            let path = checkpoint_dir.join("sessions_summary.bin");
+            if path.exists() {
+                Some(std::fs::read(&path)?)
+            } else {
+                tracing::debug!("sessions_summary.bin not found (old checkpoint format)");
+                None
+            }
+        };
+
+        let snapshots_data = {
+            let path = checkpoint_dir.join("snapshots_index.bin");
+            if path.exists() {
+                Some(std::fs::read(&path)?)
+            } else {
+                tracing::debug!("snapshots_index.bin not found (old checkpoint format)");
+                None
+            }
+        };
+
+        // Verify integrity: hash covers ALL serialized data.
+        // For v0 checkpoints (format_version == 0) the hash only covered the
+        // four core files, so we replicate that behaviour for backward compat.
         let mut combined = Vec::new();
         combined.extend_from_slice(&graph_bytes);
         combined.extend_from_slice(&itch_data);
         combined.extend_from_slice(&token_data);
         combined.extend_from_slice(&compliance_data);
+        if meta.format_version >= 1 {
+            if let Some(ref cd) = controller_data {
+                combined.extend_from_slice(cd);
+            }
+            if let Some(ref sd) = sessions_data {
+                combined.extend_from_slice(sd);
+            }
+            if let Some(ref sn) = snapshots_data {
+                combined.extend_from_slice(sn);
+            }
+        }
         let actual_hash = xxh3_64(&combined);
 
         if actual_hash != meta.combined_hash {
@@ -266,71 +367,62 @@ impl CheckpointManager {
             });
         }
 
-        // Deserialize arena
+        // Deserialize arena (has its own internal integrity check)
         let arena = Arena::deserialize_from_bytes(&graph_bytes).map_err(|e| {
             PersistenceError::Corrupted(format!("Arena deserialization failed: {e}"))
         })?;
 
-        // Deserialize token tracker
-        let token_tracker: TokenTracker = bincode::deserialize(&token_data).map_err(|e| {
-            PersistenceError::Corrupted(format!("Token tracker deserialization failed: {e}"))
-        })?;
+        // Deserialize token tracker (size-limited)
+        let token_tracker: TokenTracker = deserializer
+            .deserialize(&token_data)
+            .map_err(|e| {
+                PersistenceError::Corrupted(format!("Token tracker deserialization failed: {e}"))
+            })?;
 
-        // Deserialize compliance tracker
-        let compliance: ComplianceTracker =
-            bincode::deserialize(&compliance_data).map_err(|e| {
+        // Deserialize compliance tracker (size-limited)
+        let compliance: ComplianceTracker = deserializer
+            .deserialize(&compliance_data)
+            .map_err(|e| {
                 PersistenceError::Corrupted(format!(
                     "Compliance tracker deserialization failed: {e}"
                 ))
             })?;
 
-        // Load additional files gracefully (backward compat with old checkpoints)
-        let controller_state = {
-            let path = checkpoint_dir.join("controller_state.bin");
-            if path.exists() {
-                let data = std::fs::read(&path)?;
-                bincode::deserialize::<Vec<f32>>(&data).unwrap_or_else(|e| {
+        // Deserialize additional files with size-limited bincode
+        let controller_state = match controller_data {
+            Some(data) => {
+                deserializer.deserialize::<Vec<f32>>(&data).unwrap_or_else(|e| {
                     tracing::warn!("Failed to deserialize controller_state.bin: {e}");
                     Vec::new()
                 })
-            } else {
-                tracing::debug!("controller_state.bin not found (old checkpoint format)");
-                Vec::new()
             }
+            None => Vec::new(),
         };
 
-        let session_snapshot = {
-            let path = checkpoint_dir.join("sessions_summary.bin");
-            if path.exists() {
-                let data = std::fs::read(&path)?;
-                match bincode::deserialize::<SessionManagerSnapshot>(&data) {
+        let session_snapshot = match sessions_data {
+            Some(data) => {
+                match deserializer.deserialize::<SessionManagerSnapshot>(&data) {
                     Ok(snap) => Some(snap),
                     Err(e) => {
                         tracing::warn!("Failed to deserialize sessions_summary.bin: {e}");
                         None
                     }
                 }
-            } else {
-                tracing::debug!("sessions_summary.bin not found (old checkpoint format)");
-                None
             }
+            None => None,
         };
 
-        let snapshot_index = {
-            let path = checkpoint_dir.join("snapshots_index.bin");
-            if path.exists() {
-                let data = std::fs::read(&path)?;
-                match bincode::deserialize::<SnapshotIndex>(&data) {
+        let snapshot_index = match snapshots_data {
+            Some(data) => {
+                match deserializer.deserialize::<SnapshotIndex>(&data) {
                     Ok(idx) => Some(idx),
                     Err(e) => {
                         tracing::warn!("Failed to deserialize snapshots_index.bin: {e}");
                         None
                     }
                 }
-            } else {
-                tracing::debug!("snapshots_index.bin not found (old checkpoint format)");
-                None
             }
+            None => None,
         };
 
         tracing::info!(
@@ -403,12 +495,19 @@ impl CheckpointManager {
 
         entries.sort();
 
-        // Remove oldest checkpoints beyond the max
-        while entries.len() > self.max_checkpoints {
-            if let Some(oldest) = entries.first() {
+        // Remove oldest checkpoints beyond the max.
+        // Use drain(..excess) instead of repeated remove(0) to avoid O(n^2).
+        let excess_count = entries.len().saturating_sub(self.max_checkpoints);
+        if excess_count > 0 {
+            for oldest in entries.drain(..excess_count) {
+                // Refuse to follow symlinks — a symlink in the checkpoints dir
+                // could point anywhere and remove_dir_all would nuke the target.
+                let sym_meta = std::fs::symlink_metadata(&oldest)?;
+                if sym_meta.file_type().is_symlink() {
+                    return Err(PersistenceError::SymlinkRefused(oldest));
+                }
                 tracing::debug!(path = %oldest.display(), "Pruning old checkpoint");
-                std::fs::remove_dir_all(oldest)?;
-                entries.remove(0);
+                std::fs::remove_dir_all(&oldest)?;
             }
         }
 
@@ -496,11 +595,15 @@ pub fn resume_with_change_detection(
             .nodes_touching_file(file_path)
             .to_vec();
         for node_idx in touching {
-            let node = restored.arena.get(node_idx);
+            let status = match restored.arena.get(node_idx) {
+                Some(node) => node.status,
+                None => continue,
+            };
             // Only re-verify nodes that were previously verified
-            if node.status == crate::arena::node::NodeStatus::Verified {
-                restored.arena.get_mut(node_idx).status =
-                    crate::arena::node::NodeStatus::AwaitingVerification;
+            if status == crate::arena::node::NodeStatus::Verified {
+                if let Some(node) = restored.arena.get_mut(node_idx) {
+                    node.status = crate::arena::node::NodeStatus::AwaitingVerification;
+                }
                 // Re-set itch bit so this node blocks termination
                 restored.arena.itch.set(node_idx as usize);
                 if !affected_nodes.contains(&node_idx) {
@@ -547,7 +650,20 @@ fn scan_dir_recursive(
         Err(_) => return Ok(()), // Skip unreadable directories
     };
 
-    for entry in entries.flatten() {
+    for dir_result in entries {
+        // Log skipped entries at debug level instead of silently swallowing.
+        let entry = match dir_result {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(
+                    dir = %current.display(),
+                    error = %e,
+                    "Skipping unreadable directory entry"
+                );
+                continue;
+            }
+        };
+
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -562,10 +678,30 @@ fn scan_dir_recursive(
             continue;
         }
 
-        if path.is_dir() {
+        // Use entry.file_type() which does NOT follow symlinks (unlike
+        // path.is_dir() / path.is_file() which call stat and follow them).
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "Skipping entry: could not read file type"
+                );
+                continue;
+            }
+        };
+
+        // Skip symlinks entirely to avoid escaping the project tree.
+        if ft.is_symlink() {
+            tracing::debug!(path = %path.display(), "Skipping symlink");
+            continue;
+        }
+
+        if ft.is_dir() {
             scan_dir_recursive(&path, root, since, modified)?;
-        } else if path.is_file() {
-            if let Ok(metadata) = path.metadata() {
+        } else if ft.is_file() {
+            if let Ok(metadata) = entry.metadata() {
                 if let Ok(mod_time) = metadata.modified() {
                     if mod_time > *since {
                         // Convert to relative path string
@@ -637,6 +773,7 @@ mod tests {
 
         // Restore
         let restored = manager.restore_from(&cp_path).unwrap();
+        assert_eq!(restored.meta.format_version, CHECKPOINT_FORMAT_VERSION);
         assert_eq!(restored.meta.step, 42);
         assert_eq!(restored.arena.live_count(), 2);
         assert!(!restored.controller_state.is_empty());
@@ -702,7 +839,8 @@ mod tests {
 
     #[test]
     fn test_backward_compat_restore() {
-        // Simulate restoring from an old checkpoint without the new files
+        // Simulate restoring from an old (v0) checkpoint without the new files.
+        // v0 checkpoints only hash the 4 core files and lack format_version.
         let dir = tempdir().unwrap();
         let checkpoint_base = dir.path().join("checkpoints");
 
@@ -713,16 +851,65 @@ mod tests {
             .create_checkpoint(1, &arena, &token_tracker, &compliance, &controller, &session_manager, &snapshots)
             .unwrap();
 
-        // Delete the new files to simulate an old checkpoint
+        // Delete the extra files to simulate an old checkpoint
         fs::remove_file(cp_path.join("controller_state.bin")).unwrap();
         fs::remove_file(cp_path.join("sessions_summary.bin")).unwrap();
         fs::remove_file(cp_path.join("snapshots_index.bin")).unwrap();
 
-        // Restore should still succeed
+        // Rewrite meta.json with format_version=0 and a hash covering only
+        // the 4 core files (which is what the v0 code produced).
+        let graph_bytes = fs::read(cp_path.join("graph.bin")).unwrap();
+        let itch_data = fs::read(cp_path.join("itch.bin")).unwrap();
+        let token_data = fs::read(cp_path.join("token_accounting.bin")).unwrap();
+        let compliance_data = fs::read(cp_path.join("compliance.bin")).unwrap();
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&graph_bytes);
+        combined.extend_from_slice(&itch_data);
+        combined.extend_from_slice(&token_data);
+        combined.extend_from_slice(&compliance_data);
+        let v0_hash = xxh3_64(&combined);
+
+        let meta_json = fs::read_to_string(cp_path.join("meta.json")).unwrap();
+        let mut meta: CheckpointMeta = serde_json::from_str(&meta_json).unwrap();
+        meta.format_version = 0;
+        meta.combined_hash = v0_hash;
+        let patched_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(cp_path.join("meta.json"), patched_json).unwrap();
+
+        // Restore should still succeed with v0 backward-compat path
         let restored = manager.restore_from(&cp_path).unwrap();
         assert_eq!(restored.meta.step, 1);
+        assert_eq!(restored.meta.format_version, 0);
         assert!(restored.controller_state.is_empty());
         assert!(restored.session_snapshot.is_none());
         assert!(restored.snapshot_index.is_none());
+    }
+
+    #[test]
+    fn test_format_version_check() {
+        // A checkpoint with an unknown future format_version should be rejected.
+        let dir = tempdir().unwrap();
+        let checkpoint_base = dir.path().join("checkpoints");
+
+        let (arena, token_tracker, compliance, controller, session_manager, snapshots) = make_test_state();
+
+        let mut manager = CheckpointManager::new(checkpoint_base.clone(), 10, 5);
+        let cp_path = manager
+            .create_checkpoint(1, &arena, &token_tracker, &compliance, &controller, &session_manager, &snapshots)
+            .unwrap();
+
+        // Patch meta.json to a future version
+        let meta_json = fs::read_to_string(cp_path.join("meta.json")).unwrap();
+        let mut meta: CheckpointMeta = serde_json::from_str(&meta_json).unwrap();
+        meta.format_version = 999;
+        let patched_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(cp_path.join("meta.json"), patched_json).unwrap();
+
+        let result = manager.restore_from(&cp_path);
+        assert!(matches!(
+            result.unwrap_err(),
+            PersistenceError::FormatVersionMismatch { expected: 1, found: 999 }
+        ));
     }
 }

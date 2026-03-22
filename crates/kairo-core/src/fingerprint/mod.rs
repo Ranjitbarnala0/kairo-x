@@ -25,6 +25,7 @@ pub use detector::{fingerprint_project, DetectedLanguage, Language, PackageManag
 pub use frameworks::FrameworkInfo;
 
 use serde::{Deserialize, Serialize};
+use xxhash_rust::xxh3::Xxh3Default;
 
 // ---------------------------------------------------------------------------
 // Content fingerprinting (XXH3)
@@ -32,32 +33,41 @@ use serde::{Deserialize, Serialize};
 
 /// Streaming fingerprint builder using XXH3.
 ///
-/// Feed chunks of data and call [`finish`] to get the 64-bit fingerprint.
+/// Feeds chunks of data directly into the XXH3 streaming hasher with zero
+/// intermediate allocation. Call [`finish`] to get the 64-bit fingerprint.
 /// This is used to fingerprint context packages, file contents, and
 /// other data that may arrive incrementally.
 pub struct Fingerprinter {
-    /// Accumulated data for hashing.
-    buffer: Vec<u8>,
+    /// Streaming XXH3 hasher -- accumulates state incrementally without
+    /// buffering all input data in a `Vec<u8>`.
+    hasher: Xxh3Default,
+    /// Number of bytes fed so far (tracked separately since `Xxh3Default`
+    /// doesn't expose its `total_len`).
+    fed_bytes: u64,
 }
 
 impl Fingerprinter {
     /// Create a new fingerprinter.
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(4096),
+            hasher: Xxh3Default::new(),
+            fed_bytes: 0,
         }
     }
 
-    /// Create a new fingerprinter with the given capacity hint.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buffer: Vec::with_capacity(capacity),
-        }
+    /// Create a new fingerprinter.
+    ///
+    /// The `_capacity` parameter is accepted for API compatibility but is
+    /// ignored -- the streaming hasher uses a fixed-size internal buffer
+    /// and requires no pre-allocation.
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::new()
     }
 
     /// Feed data into the fingerprinter.
     pub fn feed(&mut self, data: &[u8]) {
-        self.buffer.extend_from_slice(data);
+        self.hasher.update(data);
+        self.fed_bytes += data.len() as u64;
     }
 
     /// Feed a string into the fingerprinter.
@@ -77,22 +87,23 @@ impl Fingerprinter {
 
     /// Finalize and return the 64-bit fingerprint.
     pub fn finish(&self) -> u64 {
-        xxhash_rust::xxh3::xxh3_64(&self.buffer)
+        self.hasher.digest()
     }
 
     /// Reset the fingerprinter for reuse.
     pub fn reset(&mut self) {
-        self.buffer.clear();
+        self.hasher.reset();
+        self.fed_bytes = 0;
     }
 
-    /// Current buffer size.
+    /// Number of bytes fed so far.
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        self.fed_bytes as usize
     }
 
-    /// Whether the buffer is empty.
+    /// Whether no data has been fed.
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.fed_bytes == 0
     }
 }
 

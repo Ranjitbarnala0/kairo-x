@@ -9,8 +9,8 @@ use kairo_llm::response::ResponseClass;
 
 use super::fallback::heuristic_classify;
 use super::patterns::{
-    self, ERROR_PATTERNS, FAIL_PATTERN, PASS_PATTERN, QUESTION_PATTERNS, REFUSAL_PATTERNS,
-    UNIVERSAL_PLACEHOLDER_PATTERNS,
+    self, placeholder_patterns_for, ERROR_PATTERNS, FAIL_PATTERN, PASS_PATTERN,
+    QUESTION_PATTERNS, REFUSAL_PATTERNS, UNIVERSAL_PLACEHOLDER_PATTERNS, Language,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,7 +30,11 @@ use super::patterns::{
 /// 6. **Incomplete detection** — check for truncation signals.
 /// 7. **Heuristic fallback** — when no deterministic rule fires, use
 ///    response characteristics to infer the class.
-pub fn classify_response(response: &str, call_type: LLMCallType) -> ClassificationResult {
+pub fn classify_response(
+    response: &str,
+    call_type: LLMCallType,
+    language: Option<Language>,
+) -> ClassificationResult {
     // Layer 1: PASS/FAIL for verification call types
     if matches!(call_type, LLMCallType::Verify | LLMCallType::Audit) {
         if let Some(result) = classify_verification_response(response) {
@@ -51,8 +55,10 @@ pub fn classify_response(response: &str, call_type: LLMCallType) -> Classificati
     // Layer 1: Error detection
     if let Some(matched) = match_any_pattern(response, &ERROR_PATTERNS) {
         // Only classify as error if the response is short (long responses with error
-        // mentions are probably discussing errors, not reporting them)
-        if response.len() < 500 {
+        // mentions are probably discussing errors, not reporting them).
+        // Use char count rather than byte length so multi-byte UTF-8 doesn't skew
+        // the threshold.
+        if response.chars().count() < 500 {
             return ClassificationResult {
                 class: ResponseClass::Error,
                 confidence: Confidence::Medium,
@@ -74,13 +80,34 @@ pub fn classify_response(response: &str, call_type: LLMCallType) -> Classificati
                 layer: ClassificationLayer::Deterministic,
             };
         }
+
+        // Language-specific placeholder patterns (§Flaw 8)
+        if let Some(lang) = language {
+            let lang_patterns = placeholder_patterns_for(lang);
+            if let Some(matched) = match_any_pattern(response, lang_patterns) {
+                return ClassificationResult {
+                    class: ResponseClass::PlaceholderDetected,
+                    confidence: Confidence::High,
+                    matched_pattern: Some(matched),
+                    layer: ClassificationLayer::Deterministic,
+                };
+            }
+        }
     }
 
     // Layer 1: Question detection
     if let Some(matched) = match_any_pattern(response, &QUESTION_PATTERNS) {
-        // Questions should dominate the response, not just appear in passing
+        // Questions should dominate the response, not just appear in passing.
+        // For short responses (<500 chars) require both a question mark AND a high
+        // fraction of question-bearing lines so we don't misfire on code containing
+        // a question pattern in a comment.
         let question_marks = response.chars().filter(|&c| c == '?').count();
-        if question_marks >= 2 || response.len() < 500 {
+        let total_lines = response.lines().count().max(1);
+        let question_lines = response.lines().filter(|l| l.contains('?')).count();
+        let question_fraction = question_lines as f64 / total_lines as f64;
+        if question_marks >= 2
+            || (response.len() < 500 && question_marks >= 1 && question_fraction > 0.3)
+        {
             return ClassificationResult {
                 class: ResponseClass::Question,
                 confidence: Confidence::Medium,
@@ -104,17 +131,35 @@ pub fn classify_response(response: &str, call_type: LLMCallType) -> Classificati
     heuristic_classify(response, call_type)
 }
 
-/// Stub for future neural classifier integration.
+/// Neural classifier integration point.
 ///
-/// Currently returns `Implementation` as the default class. When a neural
-/// model is integrated, this will perform inference on ambiguous responses.
-pub fn neural_classify(_response: &str, _call_type: LLMCallType) -> ClassificationResult {
-    ClassificationResult {
-        class: ResponseClass::Implementation,
-        confidence: Confidence::Low,
-        matched_pattern: None,
-        layer: ClassificationLayer::Neural,
-    }
+/// Returns `None` unconditionally — the neural classification model is not yet
+/// integrated. When a trained model is available, enable the `neural_classify`
+/// cargo feature and wire inference here to return
+/// `Some(ClassificationResult)` for ambiguous responses.
+///
+/// Callers should fall through to heuristic classification when this returns
+/// `None`.
+#[cfg(feature = "neural_classify")]
+pub fn neural_classify(
+    _response: &str,
+    _call_type: LLMCallType,
+) -> Option<ClassificationResult> {
+    // Neural model not yet integrated. Return None so the caller falls through
+    // to the heuristic layer.
+    None
+}
+
+/// Neural classifier stub (feature `neural_classify` not enabled).
+///
+/// Always returns `None`. Enable the `neural_classify` cargo feature once a
+/// trained model is available.
+#[cfg(not(feature = "neural_classify"))]
+pub fn neural_classify(
+    _response: &str,
+    _call_type: LLMCallType,
+) -> Option<ClassificationResult> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +211,27 @@ fn classify_verification_response(response: &str) -> Option<ClassificationResult
     let has_fail = FAIL_PATTERN.is_match(response);
 
     match (has_pass, has_fail) {
-        (true, false) => Some(ClassificationResult {
-            class: ResponseClass::VerificationPass,
-            confidence: Confidence::High,
-            matched_pattern: Some("PASS keyword".to_string()),
-            layer: ClassificationLayer::Deterministic,
-        }),
+        (true, false) => {
+            // Even if PASS is present, check the remainder for refusal patterns.
+            // An LLM might write "PASS" then hedge with refusal language, which
+            // indicates the PASS is unreliable.
+            if let Some(matched) = match_any_pattern(response, &REFUSAL_PATTERNS) {
+                return Some(ClassificationResult {
+                    class: ResponseClass::VerificationFail,
+                    confidence: Confidence::Medium,
+                    matched_pattern: Some(format!(
+                        "PASS keyword present but refusal detected: {matched}"
+                    )),
+                    layer: ClassificationLayer::Deterministic,
+                });
+            }
+            Some(ClassificationResult {
+                class: ResponseClass::VerificationPass,
+                confidence: Confidence::High,
+                matched_pattern: Some("PASS keyword".to_string()),
+                layer: ClassificationLayer::Deterministic,
+            })
+        }
         (false, true) => Some(ClassificationResult {
             class: ResponseClass::VerificationFail,
             confidence: Confidence::High,
@@ -192,22 +252,36 @@ fn classify_verification_response(response: &str) -> Option<ClassificationResult
 }
 
 /// Check if the response shows signs of being incomplete/truncated.
+///
+/// Uses a multi-signal approach: an unclosed code fence is always treated as
+/// incomplete, while softer signals (trailing ellipsis on long text, unclosed
+/// backtick pair, mid-sentence ending) require at least two simultaneous
+/// signals to trigger.
 fn is_likely_incomplete(response: &str) -> bool {
     let trimmed = response.trim_end();
 
-    // Trailing ellipsis
-    if trimmed.ends_with("...") && trimmed.len() > 20 {
-        return true;
-    }
-
-    // Unclosed code fences
+    // Unclosed code fences — always incomplete regardless of other signals
     let fence_count = response.matches("```").count();
     if fence_count % 2 != 0 {
         return true;
     }
 
-    // Very short response for implementation calls (less than 50 chars)
-    // is suspicious but not conclusive — handled by heuristic layer
+    // Multi-signal truncation detection: require at least 2 signals
+    let truncation_signals = [
+        // Trailing ellipsis on a substantive response (not a short snippet)
+        trimmed.ends_with("...") && trimmed.len() > 2000,
+        // Unclosed code fence pair (double backtick without triple)
+        trimmed.ends_with("``") && !trimmed.ends_with("```"),
+        // Mid-sentence ending: ends with lowercase letter or comma on a long response
+        trimmed.len() > 1000
+            && trimmed
+                .ends_with(|c: char| c.is_lowercase() || c == ','),
+    ];
+    let signal_count = truncation_signals.iter().filter(|&&s| s).count();
+    if signal_count >= 2 {
+        return true;
+    }
+
     false
 }
 
@@ -235,7 +309,11 @@ mod tests {
 
     #[test]
     fn test_verify_pass() {
-        let result = classify_response("PASS\nEverything looks correct.", LLMCallType::Verify);
+        let result = classify_response(
+            "PASS\nEverything looks correct.",
+            LLMCallType::Verify,
+            None,
+        );
         assert_eq!(result.class, ResponseClass::VerificationPass);
         assert_eq!(result.confidence, Confidence::High);
     }
@@ -245,6 +323,7 @@ mod tests {
         let result = classify_response(
             "FAIL\n1. Missing error handling\n2. No input validation",
             LLMCallType::Audit,
+            None,
         );
         assert_eq!(result.class, ResponseClass::VerificationFail);
         assert_eq!(result.confidence, Confidence::High);
@@ -256,8 +335,22 @@ mod tests {
         let result = classify_response(
             "PASS on the structure.\nFAIL on error handling.",
             LLMCallType::Verify,
+            None,
         );
         assert_eq!(result.class, ResponseClass::VerificationFail);
+    }
+
+    #[test]
+    fn test_verify_pass_with_refusal_downgrades() {
+        // PASS keyword present, but the response also contains refusal language.
+        // Should be downgraded to VerificationFail with Medium confidence.
+        let result = classify_response(
+            "PASS\nI cannot implement this feature though.",
+            LLMCallType::Verify,
+            None,
+        );
+        assert_eq!(result.class, ResponseClass::VerificationFail);
+        assert_eq!(result.confidence, Confidence::Medium);
     }
 
     #[test]
@@ -265,6 +358,7 @@ mod tests {
         let result = classify_response(
             "I'm unable to help with that request.",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Refusal);
     }
@@ -274,6 +368,7 @@ mod tests {
         let result = classify_response(
             "I'm sorry, but I can't write malicious code.",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Refusal);
     }
@@ -283,6 +378,7 @@ mod tests {
         let result = classify_response(
             "```rust\nfn process() {\n    // TODO: implement the processing logic\n}\n```",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::PlaceholderDetected);
     }
@@ -292,6 +388,27 @@ mod tests {
         let result = classify_response(
             "```python\ndef process():\n    # implement this later\n    pass\n```",
             LLMCallType::Implement,
+            None,
+        );
+        assert_eq!(result.class, ResponseClass::PlaceholderDetected);
+    }
+
+    #[test]
+    fn test_placeholder_detection_language_specific_rust() {
+        let result = classify_response(
+            "```rust\nfn process() {\n    todo!()\n}\n```",
+            LLMCallType::Implement,
+            Some(Language::Rust),
+        );
+        assert_eq!(result.class, ResponseClass::PlaceholderDetected);
+    }
+
+    #[test]
+    fn test_placeholder_detection_language_specific_python() {
+        let result = classify_response(
+            "```python\ndef process():\n    raise NotImplementedError\n```",
+            LLMCallType::Implement,
+            Some(Language::Python),
         );
         assert_eq!(result.class, ResponseClass::PlaceholderDetected);
     }
@@ -301,6 +418,7 @@ mod tests {
         let result = classify_response(
             "error: cannot find module 'express'",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Error);
     }
@@ -310,6 +428,7 @@ mod tests {
         let result = classify_response(
             "Before I proceed, could you clarify the expected return type?",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Question);
     }
@@ -319,6 +438,7 @@ mod tests {
         let result = classify_response(
             "Here is the implementation:\n```rust\nfn main() {\n    let x = 42;\n",
             LLMCallType::Implement,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Incomplete);
     }
@@ -328,6 +448,7 @@ mod tests {
         let result = classify_response(
             "```rust\nfn calculate_sum(a: i32, b: i32) -> i32 {\n    a + b\n}\n```\n\nThis function takes two integers and returns their sum.",
             LLMCallType::Implement,
+            None,
         );
         // Should be classified as Implementation by the heuristic fallback
         assert_eq!(result.class, ResponseClass::Implementation);
@@ -338,15 +459,14 @@ mod tests {
         let result = classify_response(
             "## Plan\n\n1. Create the database schema\n2. Implement the API endpoints\n3. Add authentication middleware\n4. Write integration tests\n\nDependencies: Step 2 depends on Step 1.",
             LLMCallType::Plan,
+            None,
         );
         assert_eq!(result.class, ResponseClass::Plan);
     }
 
     #[test]
-    fn test_neural_classify_stub() {
+    fn test_neural_classify_returns_none() {
         let result = neural_classify("anything", LLMCallType::Implement);
-        assert_eq!(result.class, ResponseClass::Implementation);
-        assert_eq!(result.layer, ClassificationLayer::Neural);
-        assert_eq!(result.confidence, Confidence::Low);
+        assert!(result.is_none(), "neural_classify should return None until model is integrated");
     }
 }

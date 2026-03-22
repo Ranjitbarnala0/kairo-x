@@ -265,9 +265,13 @@ pub(crate) fn xxh3_hash(data: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(data)
 }
 
-/// Rough token estimate: 1 token per 4 bytes of UTF-8 content.
+/// Token estimate using char count for accurate estimation across all scripts.
+///
+/// Uses ~3.5 chars per token average, which better handles multi-byte UTF-8
+/// content (CJK, emoji, etc.) compared to the old byte-based heuristic.
 pub fn estimate_tokens(text: &str) -> u32 {
-    (text.len() as u32 / 4).max(1)
+    let char_count = text.chars().count();
+    ((char_count as f64 / 3.5) as u32).max(1)
 }
 
 // ---------------------------------------------------------------------------

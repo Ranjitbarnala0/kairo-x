@@ -72,14 +72,14 @@ impl Session {
     pub fn record_usage(&mut self, input_tokens: u32, output_tokens: u32, call_type: LLMCallType) {
         self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
-        self.turn_count += 1;
+        self.turn_count = self.turn_count.saturating_add(1);
         self.last_call_type = Some(call_type);
         self.last_active_ms = chrono::Utc::now().timestamp_millis();
     }
 
     /// Record a bad response (placeholder, refusal, error, etc.).
     pub fn record_bad_response(&mut self) {
-        self.bad_response_streak += 1;
+        self.bad_response_streak = self.bad_response_streak.saturating_add(1);
     }
 
     /// Record a good response (resets the bad streak).
@@ -94,7 +94,7 @@ impl Session {
 
     /// Estimated context window usage based on messages.
     pub fn estimated_context_tokens(&self) -> u32 {
-        self.messages.iter().map(|m| m.estimated_tokens()).sum()
+        self.messages.iter().fold(0u32, |acc, m| acc.saturating_add(m.estimated_tokens()))
     }
 }
 
@@ -217,6 +217,9 @@ pub struct SessionSummary {
     pub turn_count: u32,
     pub bad_response_streak: u32,
     pub active: bool,
+    pub context_fingerprint: u64,
+    pub created_at_ms: i64,
+    pub last_active_ms: i64,
 }
 
 /// Serializable snapshot of session manager state for checkpointing.
@@ -233,6 +236,7 @@ pub struct SessionManagerSnapshot {
 ///
 /// Sessions are indexed by ID and also queryable by bound node ID.
 /// The manager handles session creation, lookup, and cleanup.
+#[derive(Debug)]
 pub struct SessionManager {
     /// All sessions indexed by session ID.
     sessions: HashMap<u32, Session>,
@@ -268,7 +272,8 @@ impl SessionManager {
         }
 
         let session_id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.checked_add(1)
+            .expect("session ID space exhausted after 4 billion sessions");
 
         let session = Session::new(session_id, node_id, context_fingerprint);
         self.sessions.insert(session_id, session);
@@ -325,6 +330,10 @@ impl SessionManager {
                     total_tokens = session.total_tokens(),
                     "Closed LLM session"
                 );
+
+                // Free message memory immediately rather than waiting for GC.
+                session.messages.clear();
+                session.messages.shrink_to_fit();
             }
         }
     }
@@ -334,6 +343,14 @@ impl SessionManager {
         if let Some(&session_id) = self.node_to_session.get(&node_id) {
             self.close_session(session_id);
         }
+    }
+
+    /// Remove all closed sessions from the map, reclaiming memory.
+    ///
+    /// Call periodically (e.g., after each planning cycle) to prevent the
+    /// sessions map from growing without bound.
+    pub fn gc_closed_sessions(&mut self) {
+        self.sessions.retain(|_, session| session.active);
     }
 
     /// Record a bad response on the session for a given node.
@@ -423,6 +440,9 @@ impl SessionManager {
                 turn_count: s.turn_count,
                 bad_response_streak: s.bad_response_streak,
                 active: s.active,
+                context_fingerprint: s.context_fingerprint,
+                created_at_ms: s.created_at_ms,
+                last_active_ms: s.last_active_ms,
             })
             .collect();
 
@@ -447,7 +467,6 @@ impl SessionManager {
         self.total_created = snapshot.total_created;
         self.total_closed = snapshot.total_closed;
 
-        let now = chrono::Utc::now().timestamp_millis();
         for summary in snapshot.summaries {
             let session = Session {
                 id: summary.id,
@@ -455,13 +474,13 @@ impl SessionManager {
                 messages: Vec::new(), // Messages not persisted
                 total_input_tokens: summary.total_input_tokens,
                 total_output_tokens: summary.total_output_tokens,
-                context_fingerprint: 0, // Will be refreshed on next call
+                context_fingerprint: summary.context_fingerprint,
                 turn_count: summary.turn_count,
                 bad_response_streak: summary.bad_response_streak,
                 active: summary.active,
                 last_call_type: None,
-                created_at_ms: now,
-                last_active_ms: now,
+                created_at_ms: summary.created_at_ms,
+                last_active_ms: summary.last_active_ms,
             };
             self.sessions.insert(summary.id, session);
         }

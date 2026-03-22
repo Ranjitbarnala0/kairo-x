@@ -186,7 +186,12 @@ impl OpenAIProvider {
             }
             return Err(ProviderError::ApiError {
                 status,
-                body: response_body,
+                body: if response_body.len() > 500 {
+                    let truncated: String = response_body.chars().take(500).collect();
+                    format!("{}...(truncated)", truncated)
+                } else {
+                    response_body
+                },
             });
         }
 

@@ -7,7 +7,7 @@ use super::executor::{self, CommandResult, ExecutorError};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -111,6 +111,23 @@ pub struct StashResult {
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
+// Secret detection
+// ---------------------------------------------------------------------------
+
+/// File-path substrings that indicate sensitive / secret content.
+const SENSITIVE_PATTERNS: &[&str] = &[
+    ".env", ".env.", "credentials", "secret", ".pem", ".key", ".p12", ".pfx",
+    ".keystore", "id_rsa", "id_ed25519", "id_ecdsa", ".htpasswd",
+    "token.json", "service-account", "gcloud", "aws-credentials",
+];
+
+/// Returns `true` if `path` matches any known sensitive-file pattern.
+fn is_sensitive_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+// ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
@@ -124,6 +141,7 @@ pub async fn status(repo_dir: &Path) -> Result<GitStatus, GitError> {
         &["status", "--porcelain=v1", "--branch"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -162,7 +180,10 @@ pub async fn status(repo_dir: &Path) -> Result<GitStatus, GitError> {
 
         let index_status = line.as_bytes()[0];
         let worktree_status = line.as_bytes()[1];
-        let file_path = line[3..].to_string();
+        let file_path = match line.get(3..) {
+            Some(p) => p.to_string(),
+            None => continue, // malformed line
+        };
 
         // Untracked files: "?? file"
         if index_status == b'?' && worktree_status == b'?' {
@@ -232,6 +253,7 @@ pub async fn diff(
         &args,
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -284,6 +306,7 @@ pub async fn diff(
         &full_args,
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -359,21 +382,122 @@ pub async fn commit(
         "git commit"
     );
 
-    // Stage changes.
-    let add_flag = if add_all { "-A" } else { "-u" };
-    let add_result = executor::execute(
-        "git",
-        &["add", add_flag],
-        Some(repo_dir),
-        Some(GIT_TIMEOUT),
-    )
-    .await?;
+    // Stage changes -- with secret detection when adding all files.
+    if add_all {
+        // Get the list of files that would be staged so we can filter out
+        // sensitive paths *before* they ever enter the index.
+        let porcelain = executor::execute(
+            "git",
+            &["status", "--porcelain=v1"],
+            Some(repo_dir),
+            Some(GIT_TIMEOUT),
+            None,
+        )
+        .await?;
 
-    if !add_result.success() {
-        return Err(GitError::CommandFailed {
-            message: add_result.stderr.clone(),
-            result: add_result,
-        });
+        if !porcelain.success() {
+            return Err(GitError::CommandFailed {
+                message: porcelain.stderr.clone(),
+                result: porcelain,
+            });
+        }
+
+        let mut safe_files: Vec<String> = Vec::new();
+        let mut blocked_files: Vec<String> = Vec::new();
+
+        for line in porcelain.stdout.lines() {
+            // Porcelain v1 format: XY <space> path  (minimum 4 chars)
+            let file_path = match line.get(3..) {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+            // Strip surrounding quotes that git adds for paths with spaces.
+            let clean_path = file_path.trim_matches('"').to_string();
+
+            if is_sensitive_file(&clean_path) {
+                blocked_files.push(clean_path);
+            } else {
+                safe_files.push(clean_path);
+            }
+        }
+
+        if !blocked_files.is_empty() {
+            warn!(
+                blocked = ?blocked_files,
+                "Refusing to stage sensitive files detected in working tree"
+            );
+        }
+
+        if safe_files.is_empty() {
+            // Nothing safe to add -- fall through; the commit will fail naturally
+            // if there is nothing staged, which is the correct behavior.
+        } else {
+            // Stage safe files in batches (avoid hitting arg-length limits).
+            for chunk in safe_files.chunks(50) {
+                let mut args: Vec<&str> = vec!["add", "--"];
+                args.extend(chunk.iter().map(String::as_str));
+
+                let add_result = executor::execute(
+                    "git",
+                    &args,
+                    Some(repo_dir),
+                    Some(GIT_TIMEOUT),
+                    None,
+                )
+                .await?;
+
+                if !add_result.success() {
+                    return Err(GitError::CommandFailed {
+                        message: add_result.stderr.clone(),
+                        result: add_result,
+                    });
+                }
+            }
+        }
+    } else {
+        // Only stage tracked (modified/deleted) files -- no untracked paths to
+        // screen, but we still run the check against the resulting index.
+        let add_result = executor::execute(
+            "git",
+            &["add", "-u"],
+            Some(repo_dir),
+            Some(GIT_TIMEOUT),
+            None,
+        )
+        .await?;
+
+        if !add_result.success() {
+            return Err(GitError::CommandFailed {
+                message: add_result.stderr.clone(),
+                result: add_result,
+            });
+        }
+
+        // After staging, verify no sensitive file crept in via tracked changes.
+        let staged_check = executor::execute(
+            "git",
+            &["diff", "--cached", "--name-only"],
+            Some(repo_dir),
+            Some(GIT_TIMEOUT),
+            None,
+        )
+        .await?;
+
+        if staged_check.success() {
+            for path in staged_check.stdout.lines() {
+                if is_sensitive_file(path) {
+                    warn!(path, "Unstaging sensitive tracked file from commit");
+                    let _ = executor::execute(
+                        "git",
+                        &["reset", "HEAD", "--", path],
+                        Some(repo_dir),
+                        Some(GIT_TIMEOUT),
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     // Commit.
@@ -382,6 +506,7 @@ pub async fn commit(
         &["commit", "-m", message],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -398,6 +523,7 @@ pub async fn commit(
         &["rev-parse", "--short", "HEAD"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -441,6 +567,7 @@ pub async fn rollback(repo_dir: &Path, files: &[&str]) -> Result<CommandResult, 
         &args,
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -474,6 +601,7 @@ pub async fn stash(
         &args,
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -494,6 +622,7 @@ pub async fn stash(
             &["stash", "list", "-1"],
             Some(repo_dir),
             Some(GIT_TIMEOUT),
+            None,
         )
         .await?;
 
@@ -521,6 +650,7 @@ pub async fn stash_pop(repo_dir: &Path) -> Result<CommandResult, GitError> {
         &["stash", "pop"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -541,6 +671,7 @@ pub async fn head_sha(repo_dir: &Path) -> Result<String, GitError> {
         &["rev-parse", "HEAD"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -561,6 +692,7 @@ pub async fn repo_root(repo_dir: &Path) -> Result<String, GitError> {
         &["rev-parse", "--show-toplevel"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -590,6 +722,7 @@ pub async fn log(
         &["log", &limit_str, "--oneline"],
         Some(repo_dir),
         Some(GIT_TIMEOUT),
+        None,
     )
     .await?;
 
@@ -667,6 +800,53 @@ index aaa..bbb 100644
         let files = parse_diff_files(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "README.md");
+    }
+
+    #[test]
+    fn test_is_sensitive_file_detects_env() {
+        assert!(is_sensitive_file(".env"));
+        assert!(is_sensitive_file(".env.production"));
+        assert!(is_sensitive_file("config/.env.local"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_detects_keys() {
+        assert!(is_sensitive_file("deploy/server.pem"));
+        assert!(is_sensitive_file("ssl/cert.key"));
+        assert!(is_sensitive_file("certs/store.p12"));
+        assert!(is_sensitive_file("keys/store.pfx"));
+        assert!(is_sensitive_file("java/release.keystore"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_detects_ssh_keys() {
+        assert!(is_sensitive_file("~/.ssh/id_rsa"));
+        assert!(is_sensitive_file("id_ed25519"));
+        assert!(is_sensitive_file("id_ecdsa.pub"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_detects_cloud_creds() {
+        assert!(is_sensitive_file("token.json"));
+        assert!(is_sensitive_file("service-account.json"));
+        assert!(is_sensitive_file(".gcloud/credentials"));
+        assert!(is_sensitive_file("aws-credentials"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_case_insensitive() {
+        assert!(is_sensitive_file("SECRET_CONFIG.yaml"));
+        assert!(is_sensitive_file("CREDENTIALS.json"));
+        assert!(is_sensitive_file(".ENV"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_safe_paths() {
+        assert!(!is_sensitive_file("src/main.rs"));
+        assert!(!is_sensitive_file("Cargo.toml"));
+        assert!(!is_sensitive_file("README.md"));
+        assert!(!is_sensitive_file("src/environment.rs")); // "env" only matches ".env"
+        assert!(!is_sensitive_file("tests/keyring_test.rs"));
     }
 
     // Integration tests require a git repository; they are run conditionally.

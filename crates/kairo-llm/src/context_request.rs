@@ -6,6 +6,7 @@
 
 use crate::response::{ContextRequest, ContextRequestKind};
 use regex::Regex;
+use std::path::{Component, Path};
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -63,11 +64,36 @@ pub fn parse_context_request(response: &str) -> Option<Vec<ContextRequest>> {
     }
 }
 
+/// Validate that a context-requested file path is safe to serve.
+///
+/// Rejects absolute paths and any path containing `..` components to prevent
+/// directory-traversal attacks from LLM-generated context requests.
+fn validate_context_path(path: &str) -> bool {
+    let p = Path::new(path);
+    // Reject absolute paths (e.g. /etc/passwd, C:\Windows\...)
+    if p.is_absolute() {
+        return false;
+    }
+    // Reject any parent-directory traversal component
+    for component in p.components() {
+        if matches!(component, Component::ParentDir) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Parse a single context request line.
 fn parse_single_request(line: &str) -> Option<ContextRequest> {
     // Try file request first
     if let Some(caps) = FILE_REQUEST_RE.captures(line) {
         let path = caps.name("path")?.as_str().to_string();
+
+        if !validate_context_path(&path) {
+            tracing::warn!(path = %path, "Rejecting context request with unsafe path");
+            return None;
+        }
+
         let line_start = caps
             .name("start")
             .and_then(|m| m.as_str().parse::<u32>().ok());
@@ -232,5 +258,53 @@ mod tests {
     fn test_empty_context_request() {
         let response = "NEED_CONTEXT:\nSome unstructured text";
         assert!(parse_context_request(response).is_none());
+    }
+
+    #[test]
+    fn test_validate_context_path_rejects_absolute() {
+        assert!(!validate_context_path("/etc/passwd"));
+        assert!(!validate_context_path("/home/user/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn test_validate_context_path_rejects_traversal() {
+        assert!(!validate_context_path("../../etc/passwd"));
+        assert!(!validate_context_path("src/../../secrets.txt"));
+        assert!(!validate_context_path(".."));
+    }
+
+    #[test]
+    fn test_validate_context_path_accepts_safe_paths() {
+        assert!(validate_context_path("src/types.ts"));
+        assert!(validate_context_path("crates/core/src/lib.rs"));
+        assert!(validate_context_path("README.md"));
+        assert!(validate_context_path("src/nested/deep/file.rs"));
+    }
+
+    #[test]
+    fn test_parse_rejects_absolute_path_request() {
+        let response =
+            "NEED_CONTEXT:\n- file: /etc/passwd (reason: need user list)\n";
+        assert!(parse_context_request(response).is_none());
+    }
+
+    #[test]
+    fn test_parse_rejects_traversal_path_request() {
+        let response =
+            "NEED_CONTEXT:\n- file: ../../etc/shadow (reason: need hashes)\n";
+        assert!(parse_context_request(response).is_none());
+    }
+
+    #[test]
+    fn test_parse_keeps_safe_requests_drops_unsafe() {
+        let response = "NEED_CONTEXT:\n- file: src/lib.rs (reason: need trait def)\n- file: /etc/passwd (reason: malicious)\n- file: ../../secrets (reason: traversal)\n";
+        let requests = parse_context_request(response).unwrap();
+        assert_eq!(requests.len(), 1);
+        match &requests[0].kind {
+            ContextRequestKind::File { path, .. } => {
+                assert_eq!(path, "src/lib.rs");
+            }
+            _ => panic!("expected file request"),
+        }
     }
 }

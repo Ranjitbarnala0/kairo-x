@@ -59,7 +59,8 @@ fn has_significant_brace_imbalance(text: &str) -> bool {
     let mut paren_depth: i32 = 0;
     let mut bracket_depth: i32 = 0;
 
-    for ch in text.chars() {
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
             continue;
@@ -77,8 +78,28 @@ fn has_significant_brace_imbalance(text: &str) -> bool {
             continue;
         }
 
+        // Detect ``` code fences — skip everything inside them so that
+        // braces in fenced code blocks don't pollute the balance count.
+        if ch == '`' && chars.as_str().starts_with("``") {
+            chars.next(); // second `
+            chars.next(); // third `
+            // Skip until the closing ``` sequence
+            let mut fence_count = 0;
+            for fence_ch in chars.by_ref() {
+                if fence_ch == '`' {
+                    fence_count += 1;
+                    if fence_count >= 3 {
+                        break;
+                    }
+                } else {
+                    fence_count = 0;
+                }
+            }
+            continue;
+        }
+
         match ch {
-            '"' | '\'' | '`' => {
+            '"' | '\'' => {
                 in_string = true;
                 string_char = ch;
             }
@@ -129,27 +150,51 @@ pub fn concatenate_responses(original: &str, continuation: &str) -> String {
     let overlap = find_overlap(original_trimmed, continuation_trimmed);
 
     if overlap > 0 {
-        format!(
-            "{}{}",
-            original_trimmed,
-            &continuation_trimmed[overlap..]
-        )
+        // The overlap was found via byte comparison, so ensure the slice point
+        // falls on a valid UTF-8 char boundary to avoid panics on multibyte text.
+        let safe_overlap = if continuation_trimmed.is_char_boundary(overlap) {
+            overlap
+        } else {
+            // Walk backwards to find the nearest valid boundary
+            (0..overlap)
+                .rev()
+                .find(|&i| continuation_trimmed.is_char_boundary(i))
+                .unwrap_or(0)
+        };
+
+        if safe_overlap > 0 {
+            format!(
+                "{}{}",
+                original_trimmed,
+                &continuation_trimmed[safe_overlap..]
+            )
+        } else {
+            // Boundary adjustment collapsed the overlap — fall through to no-overlap path
+            format!("{}\n{}", original_trimmed, continuation_trimmed)
+        }
     } else {
         format!("{}\n{}", original_trimmed, continuation_trimmed)
     }
 }
 
 /// Find the length of overlapping text between the end of `a` and the start of `b`.
+///
+/// The overlap is found via byte comparison but is guaranteed to fall on a
+/// UTF-8 char boundary in `b` so the caller can safely slice at the returned offset.
 fn find_overlap(a: &str, b: &str) -> usize {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    let max_check = a_bytes.len().min(b_bytes.len()).min(200); // Check at most 200 chars
+    let max_check = a_bytes.len().min(b_bytes.len()).min(200); // Check at most 200 bytes
 
     for overlap_len in (1..=max_check).rev() {
         let a_tail = &a_bytes[a_bytes.len() - overlap_len..];
         let b_head = &b_bytes[..overlap_len];
         if a_tail == b_head {
-            return overlap_len;
+            // Verify the overlap lands on a UTF-8 char boundary in b.
+            // If it doesn't, this match splits a multibyte character and is spurious.
+            if b.is_char_boundary(overlap_len) {
+                return overlap_len;
+            }
         }
     }
 

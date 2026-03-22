@@ -139,11 +139,7 @@ impl AnthropicProvider {
             max_tokens: request.max_output_tokens,
             system: system_text,
             messages: anthropic_messages,
-            temperature: if request.temperature == 0.0 {
-                None // Don't send temperature 0 — let API use default deterministic
-            } else {
-                Some(request.temperature)
-            },
+            temperature: Some(request.temperature),
             stop_sequences: request.stop_sequences.clone(),
         };
 
@@ -201,7 +197,12 @@ impl AnthropicProvider {
             }
             return Err(ProviderError::ApiError {
                 status,
-                body: response_body,
+                body: if response_body.len() > 500 {
+                    let truncated: String = response_body.chars().take(500).collect();
+                    format!("{}...(truncated)", truncated)
+                } else {
+                    response_body
+                },
             });
         }
 

@@ -200,40 +200,70 @@ impl ParallelScheduler {
     ///
     /// Returns `Some((track_id, node_idx))` if assignment was made, `None` if
     /// no idle tracks or no pending nodes.
+    ///
+    /// Uses a bounded loop (max 10 000 iterations) to skip stale or conflicting
+    /// entries without recursion.  A `tracing::error!` fires if the bound is
+    /// ever reached — that indicates a bug in queue maintenance.
     pub fn assign_next_pending(
         &mut self,
         arena: &mut Arena,
         _file_locks: &FileLockTable,
     ) -> Option<(u8, u32)> {
+        const MAX_ITERATIONS: u32 = 10_000;
+
         let track_id = self.find_idle_track()?;
 
-        // Pop the highest-priority pending node
-        let entry = arena.pending_queue.pop()?;
-        let node_idx = entry.node_idx;
-
-        // Verify the node is still in a state that needs execution
-        let node = arena.get(node_idx);
-        if node.status != NodeStatus::Pending && node.status != NodeStatus::Ready {
-            // Node was already claimed or completed — skip and try again
-            return self.assign_next_pending(arena, _file_locks);
-        }
-
-        // Check if this node's files conflict with any active track's files
-        for track in &self.tracks {
-            if !track.is_idle() && arena.nodes_share_files(node_idx, track.node_id) {
-                // Conflict — put the node back and try the next one
-                arena.pending_queue.push(entry);
-                // Try to find a non-conflicting node (simplified: just skip for now)
-                // In production, we'd iterate through the queue
+        let mut iterations: u32 = 0;
+        loop {
+            if iterations >= MAX_ITERATIONS {
+                tracing::error!(
+                    "assign_next_pending: hit {} iteration limit — \
+                     pending_queue may contain only stale/conflicting entries",
+                    MAX_ITERATIONS,
+                );
                 return None;
             }
+            iterations += 1;
+
+            // Pop the highest-priority pending node; empty queue → nothing to assign.
+            let entry = arena.pending_queue.pop()?;
+            let node_idx = entry.node_idx;
+
+            // Bounds-checked access: if the index is out of range (shouldn't
+            // happen, but defend against arena corruption) treat it as stale.
+            let node = match arena.nodes.get(node_idx as usize) {
+                Some(n) => n,
+                None => {
+                    tracing::error!(
+                        node_idx,
+                        "assign_next_pending: node_idx out of arena bounds, dropping entry"
+                    );
+                    continue; // stale / corrupt entry, skip
+                }
+            };
+
+            // Verify the node is still in a state that needs execution.
+            if node.status != NodeStatus::Pending && node.status != NodeStatus::Ready {
+                continue; // already claimed or completed — skip
+            }
+
+            // Check if this node's files conflict with any active track's files.
+            let has_conflict = self.tracks.iter().any(|track| {
+                !track.is_idle() && arena.nodes_share_files(node_idx, track.node_id)
+            });
+
+            if has_conflict {
+                // Conflict — put the node back and try the next one.
+                arena.pending_queue.push(entry);
+                continue;
+            }
+
+            // All checks passed — assign the node to the track.
+            arena.get_mut(node_idx).expect("node validated above").status = NodeStatus::Implementing;
+            self.tracks[track_id as usize].assign(node_idx, 0); // session_id set later
+
+            return Some((track_id, node_idx));
         }
-
-        // Assign the node to the track
-        arena.get_mut(node_idx).status = NodeStatus::Implementing;
-        self.tracks[track_id as usize].assign(node_idx, 0); // session_id set later
-
-        Some((track_id, node_idx))
     }
 
     /// Release a track (node completed, failed, or being reassigned).

@@ -128,8 +128,6 @@ pub fn heuristic_classify(response: &str, call_type: LLMCallType) -> Classificat
 struct ResponseMetrics {
     /// Total character count.
     total_chars: usize,
-    /// Number of lines in the response.
-    _line_count: usize,
     /// Ratio of characters inside code fences to total characters.
     code_ratio: f32,
     /// Whether the response contains at least one code fence.
@@ -140,8 +138,6 @@ struct ResponseMetrics {
     header_count: usize,
     /// Whether the response contains what looks like a JSON array.
     has_json_array: bool,
-    /// Number of function/method definitions detected.
-    _function_def_count: usize,
 }
 
 impl ResponseMetrics {
@@ -149,7 +145,6 @@ impl ResponseMetrics {
     fn compute(response: &str) -> Self {
         let total_chars = response.len();
         let lines: Vec<&str> = response.lines().collect();
-        let line_count = lines.len();
 
         // Count code fence characters
         let (code_chars, has_code_fence) = Self::measure_code_content(response);
@@ -178,40 +173,19 @@ impl ResponseMetrics {
             .filter(|l| l.trim_start().starts_with('#'))
             .count();
 
-        // Check for JSON array
+        // Check for JSON array — require both opening bracket and an "id" key
+        // to avoid false positives on arbitrary bracket-containing text
         let trimmed_response = response.trim();
-        let has_json_array = trimmed_response.starts_with('[') || response.contains("\"id\":");
-
-        // Count function definitions (rough heuristic)
-        let function_def_count = lines
-            .iter()
-            .filter(|l| {
-                let t = l.trim_start();
-                t.starts_with("fn ")
-                    || t.starts_with("def ")
-                    || t.starts_with("func ")
-                    || t.starts_with("function ")
-                    || t.starts_with("pub fn ")
-                    || t.starts_with("async fn ")
-                    || t.starts_with("pub async fn ")
-                    || t.starts_with("async def ")
-                    || t.starts_with("export function ")
-                    || t.starts_with("export async function ")
-                    || t.starts_with("public ")
-                    || t.starts_with("private ")
-                    || t.starts_with("protected ")
-            })
-            .count();
+        let has_json_array =
+            trimmed_response.starts_with('[') && trimmed_response.contains("\"id\":");
 
         Self {
             total_chars,
-            _line_count: line_count,
             code_ratio,
             has_code_fence,
             numbered_items,
             header_count,
             has_json_array,
-            _function_def_count: function_def_count,
         }
     }
 

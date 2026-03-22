@@ -6,6 +6,7 @@
 //! runtime can decide whether to restart sessions on a different provider.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // SessionFailoverState
@@ -25,7 +26,7 @@ pub struct SessionFailoverState {
     /// Session IDs that were active when failover occurred. These sessions
     /// should be considered for restart since they may have been mid-conversation
     /// with the primary provider.
-    pub affected_sessions: Vec<u32>,
+    pub affected_sessions: HashSet<u32>,
     /// Whether we have recovered back to the primary provider.
     pub recovered: bool,
 }
@@ -36,7 +37,7 @@ impl SessionFailoverState {
         Self {
             failover_occurred: false,
             failover_count: 0,
-            affected_sessions: Vec::new(),
+            affected_sessions: HashSet::new(),
             recovered: false,
         }
     }
@@ -44,13 +45,11 @@ impl SessionFailoverState {
     /// Record a failover event, marking all given active sessions as affected.
     pub fn record_failover(&mut self, active_session_ids: &[u32]) {
         self.failover_occurred = true;
-        self.failover_count += 1;
+        self.failover_count = self.failover_count.saturating_add(1);
         self.recovered = false;
 
         for &sid in active_session_ids {
-            if !self.affected_sessions.contains(&sid) {
-                self.affected_sessions.push(sid);
-            }
+            self.affected_sessions.insert(sid);
         }
 
         tracing::warn!(
@@ -62,8 +61,15 @@ impl SessionFailoverState {
 
     /// Record recovery back to primary provider.
     pub fn record_recovery(&mut self) {
+        self.failover_occurred = false;
         self.recovered = true;
         tracing::info!("Provider recovered to primary at session level");
+    }
+
+    /// Whether the system is currently in a failover state (failover occurred
+    /// and has not yet recovered).
+    pub fn is_in_failover(&self) -> bool {
+        self.failover_occurred && !self.recovered
     }
 
     /// Check if a specific session was affected by failover.
@@ -73,11 +79,11 @@ impl SessionFailoverState {
 
     /// Mark a session as handled (e.g., after it has been restarted).
     pub fn mark_session_handled(&mut self, session_id: u32) {
-        self.affected_sessions.retain(|&id| id != session_id);
+        self.affected_sessions.remove(&session_id);
     }
 
     /// Get all affected session IDs that still need handling.
-    pub fn pending_affected_sessions(&self) -> &[u32] {
+    pub fn pending_affected_sessions(&self) -> &HashSet<u32> {
         &self.affected_sessions
     }
 
@@ -90,7 +96,7 @@ impl SessionFailoverState {
     pub fn reset(&mut self) {
         self.failover_occurred = false;
         self.failover_count = 0;
-        self.affected_sessions.clear();
+        self.affected_sessions = HashSet::new();
         self.recovered = false;
     }
 }

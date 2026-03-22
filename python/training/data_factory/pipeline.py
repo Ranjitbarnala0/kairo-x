@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
@@ -83,13 +83,17 @@ class TrainingBatch:
     # Metadata
     trace_type: str = "context"   # "context", "budget", "action", "session"
     is_sequence: bool = False     # Whether the batch has a seq_len dimension
-    seq_length: int = 1           # Actual sequence length (before padding)
+    seq_length: Any = 1           # Per-sample tensor (batch,) int64 for sequences, or scalar int
     phase: CurriculumPhase = CurriculumPhase.PHASE_1
 
     def to(self, device: torch.device) -> "TrainingBatch":
         """Move all tensors to the given device."""
         def _move(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             return t.to(device) if t is not None else None
+
+        sl = self.seq_length
+        if isinstance(sl, torch.Tensor):
+            sl = sl.to(device)
 
         return TrainingBatch(
             input_slots=self.input_slots.to(device),
@@ -104,7 +108,7 @@ class TrainingBatch:
             session_labels=_move(self.session_labels),
             trace_type=self.trace_type,
             is_sequence=self.is_sequence,
-            seq_length=self.seq_length,
+            seq_length=sl,
             phase=self.phase,
         )
 
@@ -362,16 +366,17 @@ class TrainingPipeline:
         # 3. Slot dropout: randomly zero out a fraction of input slots
         if self.config.slot_dropout_prob > 0:
             # Determine the slot dimension position
+            dev = batch.input_slots.device
             if batch.input_slots.dim() == 3:
                 # Non-sequence: (batch, n_slots, d_slot)
                 n_slots = batch.input_slots.size(1)
-                slot_mask = (torch.rand(batch.input_slots.size(0), n_slots, 1) > self.config.slot_dropout_prob).float()
-                batch.input_slots = batch.input_slots * slot_mask.to(batch.input_slots.device)
+                slot_mask = (torch.rand(batch.input_slots.size(0), n_slots, 1, device=dev) > self.config.slot_dropout_prob).float()
+                batch.input_slots = batch.input_slots * slot_mask
             elif batch.input_slots.dim() == 4:
                 # Sequence: (batch, seq_len, n_slots, d_slot)
                 n_slots = batch.input_slots.size(2)
-                slot_mask = (torch.rand(batch.input_slots.size(0), 1, n_slots, 1) > self.config.slot_dropout_prob).float()
-                batch.input_slots = batch.input_slots * slot_mask.to(batch.input_slots.device)
+                slot_mask = (torch.rand(batch.input_slots.size(0), 1, n_slots, 1, device=dev) > self.config.slot_dropout_prob).float()
+                batch.input_slots = batch.input_slots * slot_mask
 
         return batch
 

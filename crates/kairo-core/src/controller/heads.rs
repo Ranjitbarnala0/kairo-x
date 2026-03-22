@@ -10,6 +10,7 @@
 //! 5. **Session edge-case head**: continue/reset binary (sigmoid)
 //! 6. **Stop head** (itch-gated): continue/escalate/retry/terminate (softmax with mask)
 
+use super::math::matvec_add;
 use super::weights::WeightStore;
 
 // ---------------------------------------------------------------------------
@@ -56,12 +57,25 @@ pub enum StopAction {
 // ---------------------------------------------------------------------------
 
 /// Compute all 6 output heads from the controller's final representation.
+///
+/// NOTE: Architecture mismatch with Python training heads (follow-up task).
+/// The Python heads use multi-layer MLPs with SiLU activations:
+///   - ActionHead:        LayerNorm -> Linear(288,1152) -> SiLU -> Linear(1152,576) -> SiLU -> Linear(576,34)
+///   - ContextBudgetHead: LayerNorm -> Linear(288,576) -> SiLU -> Linear(576,288) -> SiLU -> Linear(288,1)
+///   - EnforcementHead:   LayerNorm -> Linear(288,384) -> SiLU -> Linear(384,192) -> SiLU -> Linear(192,1)
+///   - SessionEdgeHead:   LayerNorm -> Linear(288,384) -> SiLU -> Linear(384,192) -> SiLU -> Linear(192,1)
+///   - StopHead:          LayerNorm -> Linear(288,576) -> SiLU -> Linear(576,288) -> SiLU -> Linear(288,4)
+///   - ContextSelection:  Bilinear query/key with temperature scaling
+/// The Rust side currently uses single-layer projections for most heads. Aligning
+/// all 6 heads' full MLP structures requires matching every layer's weight names
+/// and dimensions. This is tracked as a follow-up after the liquid block alignment
+/// is validated.
 #[allow(clippy::needless_range_loop)]
 pub fn compute_heads(
     representation: &[f32],  // [d_model = 288]
     weights: &WeightStore,
     n_context_candidates: usize,
-    itch_active: bool,       // If true, mask the terminate action
+    itch_active: bool,       // When false, mask the terminate action
 ) -> HeadOutputs {
     let d_model = representation.len();
 
@@ -179,9 +193,10 @@ pub fn compute_heads(
         d_model,
     );
 
-    // ITCH GATE: if itch register has active bits, mask the terminate action
-    // by setting its logit to -infinity (effectively zero probability after softmax)
-    if itch_active {
+    // ITCH GATE: when itch is NOT active, force "continue" by masking terminate.
+    // This matches the Python StopHead which overrides logits when ~itch_active,
+    // setting class 0 (continue) high and others to -inf.
+    if !itch_active {
         stop_logits[3] = f32::NEG_INFINITY;
     }
 
@@ -210,20 +225,6 @@ pub fn compute_heads(
 // ---------------------------------------------------------------------------
 // Math helpers
 // ---------------------------------------------------------------------------
-
-#[allow(clippy::needless_range_loop)]
-fn matvec_add(w: &[f32], b: &[f32], x: &[f32], out: &mut [f32], out_dim: usize, in_dim: usize) {
-    for i in 0..out_dim {
-        let mut sum = b.get(i).copied().unwrap_or(0.0);
-        let row_start = i * in_dim;
-        for j in 0..in_dim {
-            if row_start + j < w.len() {
-                sum += w[row_start + j] * x[j];
-            }
-        }
-        out[i] = sum;
-    }
-}
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -283,6 +284,8 @@ mod tests {
         let weights = WeightStore::zeros(&config);
         let representation = vec![0.1f32; 288];
 
+        // With itch active, terminate IS available (itch means the system
+        // detected a problem and termination is a valid response)
         let outputs = compute_heads(&representation, &weights, 5, true);
 
         // Action should be 34 probabilities summing to 1
@@ -302,9 +305,8 @@ mod tests {
         // Session continue prob should be in [0, 1]
         assert!(outputs.session_continue_prob >= 0.0 && outputs.session_continue_prob <= 1.0);
 
-        // With itch active, terminate should be masked
-        assert!(outputs.stop_probs[3].abs() < 1e-6);
-        assert_ne!(outputs.stop_action, StopAction::Terminate);
+        // With itch active, terminate IS available (not masked)
+        assert!(outputs.stop_probs[3] > 0.0);
     }
 
     #[test]
@@ -313,13 +315,14 @@ mod tests {
         let weights = WeightStore::zeros(&config);
         let representation = vec![0.0f32; 288];
 
-        // Without itch: terminate is available
+        // Without itch: terminate is MASKED (force continue, matching Python
+        // StopHead where ~itch_active overrides logits to force continue)
         let out_no_itch = compute_heads(&representation, &weights, 0, false);
-        // Uniform probs with zero weights → terminate should have non-zero prob
-        assert!(out_no_itch.stop_probs[3] > 0.0);
+        assert!(out_no_itch.stop_probs[3].abs() < 1e-6);
+        assert_ne!(out_no_itch.stop_action, StopAction::Terminate);
 
-        // With itch: terminate is masked
+        // With itch: terminate is available (all 4 options open)
         let out_with_itch = compute_heads(&representation, &weights, 0, true);
-        assert!(out_with_itch.stop_probs[3].abs() < 1e-6);
+        assert!(out_with_itch.stop_probs[3] > 0.0);
     }
 }

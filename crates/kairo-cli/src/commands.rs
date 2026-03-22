@@ -12,7 +12,23 @@ use kairo_core::persistence::CheckpointManager;
 use kairo_core::runtime::Runtime;
 use kairo_core::session::token_tracker::CostMode;
 use kairo_llm::providers::ProviderKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// RunOptions — bundles the many parameters of `handle_run`
+// ---------------------------------------------------------------------------
+
+/// All inputs needed to execute a `kairo run` invocation.
+pub struct RunOptions {
+    pub project_root: PathBuf,
+    pub task: String,
+    pub cost_mode: Option<CostMode>,
+    pub parallel: Option<u8>,
+    pub budget: Option<u64>,
+    pub resume: bool,
+    pub provider_kind: ProviderKind,
+    pub model: String,
+}
 
 // ---------------------------------------------------------------------------
 // kairo init
@@ -80,7 +96,17 @@ pub async fn handle_run(
 ) -> Result<()> {
     // Resolve the task: either a literal description or a path to a spec file.
     let task_spec = resolve_task(project_root, task)?;
-    tracing::info!(task = %task_spec, "Starting task");
+    // Truncate at a safe char boundary to avoid slicing mid-codepoint.
+    let log_end = {
+        let limit = task_spec.len().min(200);
+        // Walk backward to find a char boundary (always terminates because 0 is always a boundary).
+        let mut end = limit;
+        while !task_spec.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
+    tracing::info!(task = %&task_spec[..log_end], "Starting task");
 
     // Ensure .kairo/ exists.
     let kairo_dir = project_root.join(".kairo");
@@ -107,9 +133,9 @@ pub async fn handle_run(
     // Build the runtime.
     let mut runtime = Runtime::new(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(
-        language = %runtime.fingerprint.primary_language,
-        cost_mode = %runtime.config.cost_mode,
-        parallel = runtime.config.max_parallel_tracks,
+        language = %runtime.fingerprint().primary_language,
+        cost_mode = %runtime.config().cost_mode,
+        parallel = runtime.config().max_parallel_tracks,
         "Runtime initialized"
     );
 
@@ -119,11 +145,11 @@ pub async fn handle_run(
     }
 
     // Display the fingerprint summary.
-    display::print_fingerprint(&runtime.fingerprint);
+    display::print_fingerprint(runtime.fingerprint());
 
     println!("  Task: {}", task_spec);
-    println!("  Cost mode: {}", runtime.config.cost_mode);
-    println!("  Parallel tracks: {}", runtime.config.max_parallel_tracks);
+    println!("  Cost mode: {}", runtime.config().cost_mode);
+    println!("  Parallel tracks: {}", runtime.config().max_parallel_tracks);
     if let Some(b) = budget {
         println!("  Token budget: {b}");
     }
@@ -148,7 +174,7 @@ pub async fn handle_run(
 
     // Show initial progress
     let status = runtime.status();
-    display::print_progress(&status, &runtime.token_tracker);
+    display::print_progress(&status, runtime.token_tracker());
 
     // -----------------------------------------------------------------------
     // Step 2: Execute the plan
@@ -257,7 +283,7 @@ pub async fn handle_resume(project_root: &Path) -> Result<()> {
     restore_from_checkpoint(&mut runtime, project_root)?;
 
     let status = runtime.status();
-    display::print_progress(&status, &runtime.token_tracker);
+    display::print_progress(&status, runtime.token_tracker());
 
     // Resume execution — continue the loop from where we left off.
     let summary = runtime
@@ -274,14 +300,25 @@ pub async fn handle_resume(project_root: &Path) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve a task argument: if it is a path to an existing file, read the
-/// file contents as the spec. Otherwise treat it as a literal description.
+/// Resolve a task argument: if it is a path to an existing file within the
+/// project root, read the file contents as the spec. Otherwise treat it as a
+/// literal description. The path is canonicalized and verified to prevent
+/// directory-traversal attacks (e.g. `../../etc/passwd`).
 fn resolve_task(project_root: &Path, task: &str) -> Result<String> {
     let candidate = project_root.join(task);
-    if candidate.is_file() {
-        let content = std::fs::read_to_string(&candidate)
-            .with_context(|| format!("failed to read spec file {}", candidate.display()))?;
-        tracing::info!(path = %candidate.display(), "Loaded task spec from file");
+    if candidate.exists() {
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize task path {}", candidate.display()))?;
+        let canonical_root = project_root
+            .canonicalize()
+            .context("failed to canonicalize project root")?;
+        if !canonical.starts_with(&canonical_root) {
+            anyhow::bail!("task file path escapes project root: {}", task);
+        }
+        let content = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("failed to read spec file {}", canonical.display()))?;
+        tracing::info!(path = %canonical.display(), "Loaded task spec from file");
         Ok(content)
     } else {
         Ok(task.to_string())
@@ -308,24 +345,14 @@ fn restore_from_checkpoint(runtime: &mut Runtime, project_root: &Path) -> Result
         );
     }
 
-    // Transplant restored state into the live runtime.
-    runtime.arena = restored.arena;
-    runtime.token_tracker = restored.token_tracker;
-    runtime.compliance = restored.compliance;
-
-    // Restore controller recurrent state (if available).
-    if !restored.controller_state.is_empty() {
-        let ok = runtime.controller.deserialize_state(&restored.controller_state);
-        if ok {
-            tracing::info!("Controller recurrent state restored");
-        }
-    }
-
-    // Restore session summaries (if available).
-    if let Some(session_snapshot) = restored.session_snapshot {
-        runtime.session_manager.restore_from_snapshot(session_snapshot);
-        tracing::info!("Session summaries restored");
-    }
+    // Transplant restored state into the live runtime via the public API.
+    runtime.restore_checkpoint_state(
+        restored.arena,
+        restored.token_tracker,
+        restored.compliance,
+        &restored.controller_state,
+        restored.session_snapshot,
+    );
 
     tracing::info!(
         step = restored.meta.step,

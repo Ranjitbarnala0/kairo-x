@@ -79,6 +79,16 @@ impl LocalProvider {
             .clone()
             .unwrap_or_else(|| "http://localhost:8000".to_string());
 
+        if !base_url.starts_with("https://")
+            && !base_url.contains("localhost")
+            && !base_url.contains("127.0.0.1")
+        {
+            tracing::warn!(
+                url = %base_url,
+                "Local provider using insecure HTTP to non-localhost URL"
+            );
+        }
+
         let client = Client::builder()
             .timeout(Duration::from_secs(600)) // Local models can be slow
             .connect_timeout(Duration::from_secs(5))
@@ -145,7 +155,12 @@ impl LocalProvider {
         if status != 200 {
             return Err(ProviderError::ApiError {
                 status,
-                body: response_body,
+                body: if response_body.len() > 500 {
+                    let truncated: String = response_body.chars().take(500).collect();
+                    format!("{}...(truncated)", truncated)
+                } else {
+                    response_body
+                },
             });
         }
 

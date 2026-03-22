@@ -68,6 +68,9 @@ pub enum ExecutorError {
         stderr: String,
         result: CommandResult,
     },
+
+    #[error("disallowed shell command: {0}")]
+    DisallowedCommand(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +79,24 @@ pub enum ExecutorError {
 
 /// Default command timeout (60 seconds).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum bytes captured from stdout or stderr (50 MiB).
+///
+/// Prevents unbounded memory growth when a child process produces enormous
+/// output.  Anything beyond this limit is silently truncated.
+const MAX_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
+
+/// Allowlist of command prefixes accepted by [`execute_shell`].
+///
+/// Only shell strings that begin with one of these prefixes (or match the
+/// bare command name with no arguments) are permitted.  Everything else is
+/// rejected with [`ExecutorError::DisallowedCommand`].
+const ALLOWED_SHELL_PREFIXES: &[&str] = &[
+    "cargo ", "rustc ", "npm ", "node ", "python ", "pytest ",
+    "go ", "dotnet ", "make ", "cmake ", "git ",
+    "ls ", "cat ", "head ", "tail ", "wc ", "sort ", "grep ", "find ",
+    "echo ", "mkdir ", "cp ", "mv ",
+];
 
 /// Execute a shell command with timeout support.
 ///
@@ -87,6 +108,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 ///   inherits the parent's cwd.
 /// * `timeout` — maximum wall-clock time before killing the process.
 ///   If `None`, defaults to 60 seconds.
+/// * `env` — optional slice of `(key, value)` pairs injected into the
+///   child's environment.  Existing variables are preserved; duplicates
+///   are overwritten.
 ///
 /// # Returns
 ///
@@ -98,6 +122,7 @@ pub async fn execute(
     args: &[&str],
     working_dir: Option<&Path>,
     timeout: Option<Duration>,
+    env: Option<&[(&str, &str)]>,
 ) -> Result<CommandResult, ExecutorError> {
     let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
     let cmd_display = format!("{} {}", cmd, args.join(" "));
@@ -113,6 +138,12 @@ pub async fn execute(
 
     if let Some(dir) = working_dir {
         command.current_dir(dir);
+    }
+
+    if let Some(vars) = env {
+        for &(key, value) in vars {
+            command.env(key, value);
+        }
     }
 
     let start = std::time::Instant::now();
@@ -134,24 +165,8 @@ pub async fn execute(
 
     match wait_result {
         Ok(Ok(exit_status)) => {
-            let stdout = match child_stdout {
-                Some(mut out) => {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    let _ = out.read_to_end(&mut buf).await;
-                    String::from_utf8_lossy(&buf).into_owned()
-                }
-                None => String::new(),
-            };
-            let stderr = match child_stderr {
-                Some(mut err) => {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    let _ = err.read_to_end(&mut buf).await;
-                    String::from_utf8_lossy(&buf).into_owned()
-                }
-                None => String::new(),
-            };
+            let stdout = read_pipe_bounded(child_stdout, &cmd_display, "stdout").await;
+            let stderr = read_stderr_bounded(child_stderr, &cmd_display, "stderr").await;
             let exit_code = exit_status.code();
 
             trace!(
@@ -184,6 +199,64 @@ pub async fn execute(
     }
 }
 
+/// Read up to [`MAX_OUTPUT_BYTES`] from an optional child pipe.
+///
+/// If the read encounters an I/O error the partial buffer collected so far is
+/// returned and a warning is logged — the caller still gets whatever bytes were
+/// captured before the failure.
+async fn read_pipe_bounded(
+    pipe: Option<tokio::process::ChildStdout>,
+    cmd_display: &str,
+    stream_name: &str,
+) -> String {
+    match pipe {
+        Some(out) => {
+            use tokio::io::AsyncReadExt;
+            let mut bounded = out.take(MAX_OUTPUT_BYTES as u64);
+            let mut buf = Vec::new();
+            if let Err(e) = bounded.read_to_end(&mut buf).await {
+                warn!(
+                    cmd = %cmd_display,
+                    stream = stream_name,
+                    error = %e,
+                    bytes_captured = buf.len(),
+                    "error reading command {stream_name}, returning partial output",
+                );
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        None => String::new(),
+    }
+}
+
+/// Read up to [`MAX_OUTPUT_BYTES`] from an optional child stderr pipe.
+///
+/// Mirror of [`read_pipe_bounded`] for the stderr handle type.
+async fn read_stderr_bounded(
+    pipe: Option<tokio::process::ChildStderr>,
+    cmd_display: &str,
+    stream_name: &str,
+) -> String {
+    match pipe {
+        Some(out) => {
+            use tokio::io::AsyncReadExt;
+            let mut bounded = out.take(MAX_OUTPUT_BYTES as u64);
+            let mut buf = Vec::new();
+            if let Err(e) = bounded.read_to_end(&mut buf).await {
+                warn!(
+                    cmd = %cmd_display,
+                    stream = stream_name,
+                    error = %e,
+                    bytes_captured = buf.len(),
+                    "error reading command {stream_name}, returning partial output",
+                );
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        None => String::new(),
+    }
+}
+
 /// Execute a command and return an error if it exits with a non-zero code.
 ///
 /// Convenience wrapper around `execute` for cases where you expect success.
@@ -192,8 +265,9 @@ pub async fn execute_expecting_success(
     args: &[&str],
     working_dir: Option<&Path>,
     timeout: Option<Duration>,
+    env: Option<&[(&str, &str)]>,
 ) -> Result<CommandResult, ExecutorError> {
-    let result = execute(cmd, args, working_dir, timeout).await?;
+    let result = execute(cmd, args, working_dir, timeout, env).await?;
     if !result.success() {
         let exit_code = result.exit_code.unwrap_or(-1);
         return Err(ExecutorError::NonZeroExit {
@@ -209,13 +283,27 @@ pub async fn execute_expecting_success(
 ///
 /// Use this for piped commands or complex shell expressions. Prefer
 /// `execute()` for simple commands (avoids shell injection risks).
-pub async fn execute_shell(
+///
+/// The command must begin with one of the prefixes in
+/// [`ALLOWED_SHELL_PREFIXES`]; otherwise an
+/// [`ExecutorError::DisallowedCommand`] is returned.
+pub(crate) async fn execute_shell(
     shell_cmd: &str,
     working_dir: Option<&Path>,
     timeout: Option<Duration>,
 ) -> Result<CommandResult, ExecutorError> {
+    let trimmed = shell_cmd.trim_start();
+    let allowed = ALLOWED_SHELL_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
+
+    if !allowed {
+        warn!(shell_cmd, "rejected disallowed shell command");
+        return Err(ExecutorError::DisallowedCommand(shell_cmd.to_string()));
+    }
+
     debug!(shell_cmd, "executing shell command");
-    execute("sh", &["-c", shell_cmd], working_dir, timeout).await
+    execute("sh", &["-c", shell_cmd], working_dir, timeout, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -315,24 +403,8 @@ impl CommandBuilder {
 
         match wait_result {
             Ok(Ok(exit_status)) => {
-                let stdout = match child_stdout {
-                    Some(mut out) => {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = out.read_to_end(&mut buf).await;
-                        String::from_utf8_lossy(&buf).into_owned()
-                    }
-                    None => String::new(),
-                };
-                let stderr = match child_stderr {
-                    Some(mut err) => {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = err.read_to_end(&mut buf).await;
-                        String::from_utf8_lossy(&buf).into_owned()
-                    }
-                    None => String::new(),
-                };
+                let stdout = read_pipe_bounded(child_stdout, &cmd_display, "stdout").await;
+                let stderr = read_stderr_bounded(child_stderr, &cmd_display, "stderr").await;
                 let exit_code = exit_status.code();
 
                 Ok(CommandResult {
@@ -379,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_echo() {
-        let result = execute("echo", &["hello", "world"], None, None)
+        let result = execute("echo", &["hello", "world"], None, None, None)
             .await
             .unwrap();
         assert!(result.success());
@@ -395,6 +467,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
         assert!(matches!(result, Err(ExecutorError::SpawnFailed { .. })));
@@ -402,20 +475,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_non_zero_exit() {
-        let result = execute("false", &[], None, None).await.unwrap();
+        let result = execute("false", &[], None, None, None).await.unwrap();
         assert!(!result.success());
         assert_ne!(result.exit_code, Some(0));
     }
 
     #[tokio::test]
     async fn test_execute_expecting_success_fails() {
-        let result = execute_expecting_success("false", &[], None, None).await;
+        let result = execute_expecting_success("false", &[], None, None, None).await;
         assert!(matches!(result, Err(ExecutorError::NonZeroExit { .. })));
     }
 
     #[tokio::test]
     async fn test_execute_with_working_dir() {
-        let result = execute("pwd", &[], Some(Path::new("/tmp")), None)
+        let result = execute("pwd", &[], Some(Path::new("/tmp")), None, None)
             .await
             .unwrap();
         assert!(result.success());
@@ -434,6 +507,7 @@ mod tests {
             &["30"],
             None,
             Some(Duration::from_millis(100)),
+            None,
         )
         .await;
         assert!(matches!(result, Err(ExecutorError::Timeout { .. })));
@@ -441,6 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_captures_stderr() {
+        // Uses "echo " prefix which is in the allowlist.
         let result = execute_shell(
             "echo 'out' && echo 'err' >&2",
             None,
@@ -455,6 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_shell() {
+        // Uses "echo " prefix which is in the allowlist.
         let result = execute_shell(
             "echo hello | tr 'h' 'H'",
             None,
@@ -464,6 +540,31 @@ mod tests {
         .unwrap();
         assert!(result.success());
         assert_eq!(result.stdout.trim(), "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_disallowed() {
+        let result = execute_shell("curl http://example.com", None, None).await;
+        assert!(
+            matches!(result, Err(ExecutorError::DisallowedCommand(ref cmd)) if cmd.contains("curl")),
+            "expected DisallowedCommand, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_env() {
+        let env_vars: &[(&str, &str)] = &[("KAIRO_TEST_VAR", "hello_from_kairo")];
+        let result = execute(
+            "sh",
+            &["-c", "echo $KAIRO_TEST_VAR"],
+            None,
+            None,
+            Some(env_vars),
+        )
+        .await
+        .unwrap();
+        assert!(result.success());
+        assert_eq!(result.stdout.trim(), "hello_from_kairo");
     }
 
     #[tokio::test]
@@ -516,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duration_tracked() {
-        let result = execute("sleep", &["0.1"], None, None).await.unwrap();
+        let result = execute("sleep", &["0.1"], None, None, None).await.unwrap();
         assert!(result.duration >= Duration::from_millis(50));
     }
 }

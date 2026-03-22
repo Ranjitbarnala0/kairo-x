@@ -66,6 +66,18 @@ pub struct EditApplication {
 // Parsing
 // ---------------------------------------------------------------------------
 
+/// Find a delimiter that appears at the start of a line (position 0 or
+/// immediately after a `\n`). This prevents content that happens to contain
+/// `>>>` mid-line from being misinterpreted as a block boundary.
+fn find_line_delimiter(text: &str, delimiter: &str) -> Option<usize> {
+    for (i, _) in text.match_indices(delimiter) {
+        if i == 0 || text.as_bytes().get(i.wrapping_sub(1)) == Some(&b'\n') {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Parse `<<<SEARCH ... >>> <<<REPLACE ... >>>` blocks from LLM output.
 ///
 /// Supports the format:
@@ -96,8 +108,9 @@ pub fn parse_search_replace_blocks(response: &str) -> Vec<SearchReplaceBlock> {
         };
         let search_body = &after_marker[search_content_start..];
 
-        // Find the closing >>>.
-        let search_end = match search_body.find(">>>") {
+        // Find the closing >>> — must be at the start of a line to avoid
+        // matching `>>>` that appears inside file content.
+        let search_end = match find_line_delimiter(search_body, ">>>") {
             Some(pos) => pos,
             None => break,
         };
@@ -132,8 +145,8 @@ pub fn parse_search_replace_blocks(response: &str) -> Vec<SearchReplaceBlock> {
         };
         let replace_body = &after_replace_marker[replace_content_start..];
 
-        // Find the closing >>> for the replace block.
-        let replace_end = match replace_body.find(">>>") {
+        // Find the closing >>> for the replace block — line-start only.
+        let replace_end = match find_line_delimiter(replace_body, ">>>") {
             Some(pos) => pos,
             None => break,
         };
@@ -195,6 +208,18 @@ pub fn normalize_whitespace(s: &str) -> String {
         .join("\n")
 }
 
+/// Build a table of byte offsets for the start of each line.
+///
+/// Entry `i` is the byte offset where line `i` begins. Handles both
+/// `\n` (Unix) and `\r\n` (Windows) line terminators correctly.
+fn build_line_start_table(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, _) in text.match_indices('\n') {
+        starts.push(i + 1); // byte after the `\n`
+    }
+    starts
+}
+
 /// Find a whitespace-normalized match of `needle` in `haystack`.
 ///
 /// Returns `Some((start, end))` byte offsets in the *original* haystack
@@ -226,6 +251,12 @@ pub fn find_normalized(haystack: &str, needle: &str) -> Option<(usize, usize)> {
         .map(|l| normalize_whitespace(l))
         .collect();
 
+    // Build a line-start-offset table from actual newline positions.
+    // This correctly handles both \n and \r\n terminators (since
+    // match_indices('\n') finds the \n in both cases, and the byte
+    // after it is always the start of the next line).
+    let line_starts = build_line_start_table(haystack);
+
     // Sliding window: find contiguous lines that match.
     'outer: for start_line in 0..=(haystack_lines.len() - n_lines) {
         for (i, needle_line) in needle_lines.iter().enumerate() {
@@ -234,20 +265,13 @@ pub fn find_normalized(haystack: &str, needle: &str) -> Option<(usize, usize)> {
             }
         }
 
-        // Found a match. Compute byte offsets in the original haystack.
-        let byte_start = haystack_lines[..start_line]
-            .iter()
-            .map(|l| l.len() + 1) // +1 for newline
-            .sum::<usize>();
+        // Found a match. Compute byte offsets using the line-start table.
+        let byte_start = line_starts[start_line];
         let end_line = start_line + n_lines - 1;
-        let byte_end = haystack_lines[..end_line]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-            + haystack_lines[end_line].len();
-
-        // Ensure byte_end doesn't exceed haystack length.
-        let byte_end = byte_end.min(haystack.len());
+        // End of the matched region is the start of the last matched line
+        // plus that line's byte length.
+        let byte_end = (line_starts[end_line] + haystack_lines[end_line].len())
+            .min(haystack.len());
 
         return Some((byte_start, byte_end));
     }
@@ -286,6 +310,10 @@ pub fn find_fuzzy(
 
     let max_distance = (max_distance_ratio * needle.len() as f64).ceil() as usize;
     let mut best: Option<(usize, usize, usize)> = None;
+
+    // Build a line-start-offset table from actual newline positions.
+    // This correctly handles both \n and \r\n terminators.
+    let line_starts = build_line_start_table(haystack);
 
     // Try windows of size n_lines, n_lines-1, n_lines+1 to handle minor
     // line count differences.
@@ -341,18 +369,12 @@ pub fn find_fuzzy(
                     .map(|b| distance < b.2)
                     .unwrap_or(true);
                 if is_better {
-                    // Compute byte offsets.
-                    let byte_start: usize = haystack_lines[..start]
-                        .iter()
-                        .map(|l| l.len() + 1)
-                        .sum();
+                    // Compute byte offsets using the line-start table.
+                    let byte_start = line_starts[start];
                     let end_line = start + win_size - 1;
-                    let byte_end: usize = haystack_lines[..end_line]
-                        .iter()
-                        .map(|l| l.len() + 1)
-                        .sum::<usize>()
-                        + haystack_lines[end_line].len();
-                    let byte_end = byte_end.min(haystack.len());
+                    let byte_end = (line_starts[end_line]
+                        + haystack_lines[end_line].len())
+                        .min(haystack.len());
 
                     best = Some((byte_start, byte_end, distance));
 
@@ -434,11 +456,19 @@ fn apply_single_edit(
 
     // Level 1: Exact match.
     if let Some(offset) = content.find(&edit.search) {
-        // Verify uniqueness — check there isn't a second occurrence.
-        if let Some(second) = content[offset + edit.search.len()..].find(&edit.search) {
-            let _ = second; // suppress unused warning
-            // Multiple exact matches. We still use the first one but log a warning.
-            warn!("multiple exact matches found; using first occurrence");
+        // Verify uniqueness — reject if there are multiple occurrences.
+        // Ambiguous matches are dangerous: silently picking the first one
+        // could modify the wrong location. Force the LLM to provide more
+        // context so the match is unambiguous.
+        let mut count = 1usize;
+        let mut search_from = offset + edit.search.len();
+        while let Some(pos) = content[search_from..].find(&edit.search) {
+            count += 1;
+            search_from += pos + edit.search.len();
+        }
+        if count > 1 {
+            warn!(count, "ambiguous exact match — rejecting");
+            return Err(EditError::AmbiguousMatch { count });
         }
         return Ok(EditApplication {
             level: MatchLevel::Exact,
@@ -866,5 +896,128 @@ fn compute(x: i32) -> i32 {
         assert!(result.contains("let y = 20;"));
         assert!(result.contains("use std::io;"));
         assert!(result.contains("println!"));
+    }
+
+    // -- Ambiguous match tests (fix #1) --
+
+    #[test]
+    fn test_ambiguous_exact_match_returns_error() {
+        // Content has "let x = 1;" appearing twice.
+        let content = "let x = 1;\nlet y = 2;\nlet x = 1;";
+        let edits = vec![SearchReplaceBlock {
+            search: "let x = 1;".to_string(),
+            replace: "let x = 99;".to_string(),
+        }];
+
+        let result = apply_edits(content, &edits);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EditError::AmbiguousMatch { count } => assert_eq!(count, 2),
+            other => panic!("expected AmbiguousMatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ambiguous_match_three_occurrences() {
+        let content = "foo\nfoo\nfoo";
+        let edits = vec![SearchReplaceBlock {
+            search: "foo".to_string(),
+            replace: "bar".to_string(),
+        }];
+
+        let result = apply_edits(content, &edits);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EditError::AmbiguousMatch { count } => assert_eq!(count, 3),
+            other => panic!("expected AmbiguousMatch, got: {other:?}"),
+        }
+    }
+
+    // -- CRLF line ending tests (fix #2 & #4) --
+
+    #[test]
+    fn test_find_normalized_crlf() {
+        // Haystack with \r\n line endings.
+        let haystack = "fn main() {\r\n    let  x  = 1;\r\n    println!(\"hi\");\r\n}";
+        let needle = "let x = 1;\nprintln!(\"hi\");";
+
+        let result = find_normalized(haystack, needle);
+        assert!(result.is_some());
+        let (start, end) = result.unwrap();
+        let matched = &haystack[start..end];
+        assert!(matched.contains("let"));
+        assert!(matched.contains("println!"));
+    }
+
+    #[test]
+    fn test_find_fuzzy_crlf() {
+        // Haystack with \r\n line endings, needle with minor typo.
+        let haystack =
+            "fn calc_total(items: &[Item]) -> f64 {\r\n    items.iter().map(|i| i.price).sum()\r\n}";
+        let needle =
+            "fn calc_totl(items: &[Item]) -> f64 {\n    items.iter().map(|i| i.price).sum()\n}";
+
+        let result = find_fuzzy(haystack, needle, 0.20);
+        assert!(result.is_some());
+        let (start, end, _distance) = result.unwrap();
+        // Byte offsets must land inside the haystack.
+        assert!(start < haystack.len());
+        assert!(end <= haystack.len());
+        let matched = &haystack[start..end];
+        assert!(matched.contains("calc_total"));
+    }
+
+    #[test]
+    fn test_build_line_start_table_lf() {
+        let text = "aaa\nbbb\nccc";
+        let starts = build_line_start_table(text);
+        assert_eq!(starts, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn test_build_line_start_table_crlf() {
+        let text = "aaa\r\nbbb\r\nccc";
+        let starts = build_line_start_table(text);
+        // \r\n: the \n is at byte 4, so next line starts at byte 5.
+        assert_eq!(starts, vec![0, 5, 10]);
+    }
+
+    // -- Delimiter injection tests (fix #3) --
+
+    #[test]
+    fn test_find_line_delimiter_at_start() {
+        assert_eq!(find_line_delimiter(">>> rest", ">>>"), Some(0));
+    }
+
+    #[test]
+    fn test_find_line_delimiter_after_newline() {
+        let text = "some code\n>>>\nmore";
+        assert_eq!(find_line_delimiter(text, ">>>"), Some(10));
+    }
+
+    #[test]
+    fn test_find_line_delimiter_mid_line_ignored() {
+        // `>>>` appears mid-line — should NOT match.
+        let text = "some code >>> more stuff\n>>>\n";
+        // The first `>>>` is at byte 10, but preceded by ' ' not '\n'.
+        // The second `>>>` is at byte 24, preceded by '\n'. That should match.
+        assert_eq!(find_line_delimiter(text, ">>>"), Some(24));
+    }
+
+    #[test]
+    fn test_find_line_delimiter_none() {
+        let text = "no delimiters here at all";
+        assert_eq!(find_line_delimiter(text, ">>>"), None);
+    }
+
+    #[test]
+    fn test_parse_ignores_mid_line_delimiter() {
+        // The search content itself contains ">>>" mid-line. The parser
+        // should NOT treat it as the closing delimiter.
+        let input = "<<<SEARCH\nline with >>> in it\n>>>\n<<<REPLACE\nreplaced\n>>>\n";
+        let blocks = parse_search_replace_blocks(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search, "line with >>> in it");
+        assert_eq!(blocks[0].replace, "replaced");
     }
 }

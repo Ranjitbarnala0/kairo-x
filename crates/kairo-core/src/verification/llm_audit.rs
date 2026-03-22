@@ -110,24 +110,19 @@ impl LlmAuditor {
 
         for line in response.lines() {
             let trimmed = line.trim();
-            // Match lines starting with a number followed by a period or parenthesis
-            if trimmed.len() >= 3 {
-                let first_char = trimmed.as_bytes()[0];
-                if first_char.is_ascii_digit() {
-                    if let Some(rest) = trimmed
-                        .strip_prefix(|c: char| c.is_ascii_digit())
-                        .and_then(|s| {
-                            s.strip_prefix(|c: char| c.is_ascii_digit())
-                                .or(Some(s))
-                        })
-                    {
-                        if rest.starts_with('.') || rest.starts_with(')') {
-                            let issue_text = rest[1..].trim();
-                            if !issue_text.is_empty() {
-                                issues.push(issue_text.to_string());
-                            }
-                        }
-                    }
+            // Strip ALL leading digits (handles "1.", "12.", "100.", etc.)
+            let digit_end = trimmed
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(trimmed.len());
+            if digit_end == 0 {
+                continue;
+            }
+            let rest = &trimmed[digit_end..];
+            // Expect a period or closing paren immediately after the digits
+            if rest.starts_with('.') || rest.starts_with(')') {
+                let issue_text = rest[1..].trim();
+                if !issue_text.is_empty() {
+                    issues.push(issue_text.to_string());
                 }
             }
         }

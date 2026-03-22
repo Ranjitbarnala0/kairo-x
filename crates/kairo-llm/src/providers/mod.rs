@@ -59,10 +59,11 @@ impl std::fmt::Display for ProviderKind {
 // Provider specification
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderSpec {
     pub kind: ProviderKind,
     pub model: String,
+    #[serde(skip_serializing)]
     pub api_key_env: String,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
@@ -72,6 +73,33 @@ pub struct ProviderSpec {
     pub cost_per_output_mtok: u32,
     /// Base URL override (for local or custom endpoints)
     pub base_url: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSpec")
+            .field("kind", &self.kind)
+            .field("model", &self.model)
+            .field("api_key_env", &"[REDACTED]")
+            .field("max_context_tokens", &self.max_context_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+impl ProviderSpec {
+    /// Validate that the spec contains sane values.
+    /// Returns an error string describing what is wrong, or `Ok(())`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_context_tokens == 0 {
+            return Err("max_context_tokens must be > 0".to_string());
+        }
+        if self.max_output_tokens == 0 {
+            return Err("max_output_tokens must be > 0".to_string());
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +135,14 @@ pub struct ProviderConfig {
 // Failover manager
 // ---------------------------------------------------------------------------
 
+/// Cooldown period (in milliseconds) before we attempt to recover the
+/// primary provider after a failover. 5 minutes.
+const PRIMARY_RECOVERY_COOLDOWN_MS: i64 = 300_000;
+
+/// Number of consecutive successful calls on the fallback provider required
+/// before we consider switching back to primary.
+const RECOVERY_SUCCESS_THRESHOLD: u32 = 10;
+
 /// Manages provider failover: tracks consecutive failures on primary,
 /// switches to fallback after threshold.
 pub struct ProviderManager {
@@ -121,6 +157,13 @@ struct FailoverState {
     consecutive_failures: u32,
     using_fallback: bool,
     failover_threshold: u32,
+    /// How many successful calls have been made while on the fallback provider.
+    /// Once this reaches [`RECOVERY_SUCCESS_THRESHOLD`], we attempt to switch
+    /// back to primary.
+    fallback_success_count: u32,
+    /// Epoch-millis timestamp of the last time we attempted (or switched back
+    /// to) the primary provider. Used for cooldown gating.
+    last_primary_attempt_ms: i64,
 }
 
 impl ProviderManager {
@@ -131,6 +174,8 @@ impl ProviderManager {
                 consecutive_failures: 0,
                 using_fallback: false,
                 failover_threshold,
+                fallback_success_count: 0,
+                last_primary_attempt_ms: 0,
             }),
         }
     }
@@ -147,9 +192,14 @@ impl ProviderManager {
     }
 
     /// Record a successful call — resets failure counter.
+    /// While on fallback, also increments `fallback_success_count` so the
+    /// recovery logic knows when conditions are stable enough to try primary.
     pub fn record_success(&self) {
         let mut state = self.lock_state();
         state.consecutive_failures = 0;
+        if state.using_fallback {
+            state.fallback_success_count += 1;
+        }
     }
 
     /// Record a failed call. Returns true if we switched to fallback.
@@ -177,6 +227,14 @@ impl ProviderManager {
     }
 
     /// Get the currently active provider spec.
+    ///
+    /// # Deprecated
+    ///
+    /// This method is **TOCTOU-unsafe**: it releases the failover lock before
+    /// the caller reads the returned reference, so the active provider can
+    /// change between the check and the use. Prefer [`active_spec_cloned`]
+    /// for all new call-sites — it returns a snapshot taken while the lock
+    /// is held.
     pub fn active_spec(&self) -> &ProviderSpec {
         if self.is_using_fallback() {
             self.config
@@ -188,6 +246,22 @@ impl ProviderManager {
         }
     }
 
+    /// Return a cloned snapshot of the active spec, determined while holding
+    /// the failover lock. This avoids the TOCTOU race in [`active_spec`]
+    /// where the fallback state could change between the `is_using_fallback()`
+    /// check and the field access.
+    pub fn active_spec_cloned(&self) -> ProviderSpec {
+        let state = self.lock_state();
+        if state.using_fallback {
+            self.config
+                .fallback
+                .clone()
+                .unwrap_or_else(|| self.config.primary.clone())
+        } else {
+            self.config.primary.clone()
+        }
+    }
+
     /// Get the provider spec for audit calls (may be different model).
     pub fn audit_spec(&self) -> &ProviderSpec {
         self.config
@@ -196,10 +270,57 @@ impl ProviderManager {
             .unwrap_or_else(|| self.active_spec())
     }
 
-    /// Reset to primary provider (e.g., after a cooldown period).
+    /// Hard-reset to primary provider (e.g., after a cooldown period or
+    /// operator intervention). Clears all failover and recovery counters.
     pub fn reset_to_primary(&self) {
         let mut state = self.lock_state();
         state.consecutive_failures = 0;
         state.using_fallback = false;
+        state.fallback_success_count = 0;
+        state.last_primary_attempt_ms = chrono::Utc::now().timestamp_millis();
+    }
+
+    // -----------------------------------------------------------------------
+    // Primary recovery
+    // -----------------------------------------------------------------------
+
+    /// Returns `true` if we are on fallback and enough time has elapsed since
+    /// the last primary attempt to justify probing primary again.
+    ///
+    /// Callers should gate a single primary-probe request on this returning
+    /// `true`. If the probe succeeds, call [`try_reset_to_primary`].
+    pub fn should_try_primary_recovery(&self) -> bool {
+        let state = self.lock_state();
+        if !state.using_fallback {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        now - state.last_primary_attempt_ms >= PRIMARY_RECOVERY_COOLDOWN_MS
+    }
+
+    /// Attempt to switch back to the primary provider.
+    ///
+    /// Succeeds only when we are on fallback **and** the fallback has
+    /// accumulated at least [`RECOVERY_SUCCESS_THRESHOLD`] consecutive
+    /// successful calls — indicating stable connectivity.
+    ///
+    /// Returns `true` if the switch happened.
+    pub fn try_reset_to_primary(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.using_fallback
+            && state.fallback_success_count >= RECOVERY_SUCCESS_THRESHOLD
+        {
+            state.using_fallback = false;
+            state.consecutive_failures = 0;
+            state.fallback_success_count = 0;
+            state.last_primary_attempt_ms = chrono::Utc::now().timestamp_millis();
+            tracing::info!(
+                "Recovered to primary provider after {} successful fallback calls",
+                RECOVERY_SUCCESS_THRESHOLD,
+            );
+            true
+        } else {
+            false
+        }
     }
 }

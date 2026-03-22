@@ -198,11 +198,10 @@ class CurriculumManager:
         pm = self._phase_metrics[self._phase_idx]
         pm.step_count += 1
         pm.loss_history.append(loss)
+        # Cap loss_history to prevent unbounded memory growth
+        if len(pm.loss_history) > 1000:
+            pm.loss_history = pm.loss_history[-1000:]
         self._global_step += 1
-
-        if loss < pm.best_total_loss - self.config.min_improvement:
-            pm.best_total_loss = loss
-            pm.evals_without_improvement = 0
 
     def should_evaluate(self) -> bool:
         """Whether it's time to run evaluation."""

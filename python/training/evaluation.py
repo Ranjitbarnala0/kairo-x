@@ -386,13 +386,16 @@ class Evaluator:
         """
         from training.data_factory.pipeline import TrainingBatch
 
-        # Build seq_mask if needed
+        # Build per-sample seq_mask from the seq_length tensor
         seq_mask = None
         if batch.is_sequence and batch.action_labels is not None:
             B, T = batch.action_labels.shape
+            seq_len = batch.seq_length
+            if not isinstance(seq_len, torch.Tensor):
+                seq_len = torch.tensor([seq_len] * B, device=batch.action_labels.device)
             seq_mask = torch.arange(T, device=batch.action_labels.device).unsqueeze(
                 0
-            ).expand(B, -1) < batch.seq_length
+            ).expand(B, -1) < seq_len.unsqueeze(1)
 
         # Context selection
         if (
@@ -451,9 +454,12 @@ class Evaluator:
             ses_mask = None
             if batch.is_sequence and batch.session_labels is not None:
                 B, T = batch.session_labels.shape
+                seq_len = batch.seq_length
+                if not isinstance(seq_len, torch.Tensor):
+                    seq_len = torch.tensor([seq_len] * B, device=batch.session_labels.device)
                 ses_mask = torch.arange(
                     T, device=batch.session_labels.device
-                ).unsqueeze(0).expand(B, -1) < batch.seq_length
+                ).unsqueeze(0).expand(B, -1) < seq_len.unsqueeze(1)
             self.update_session(
                 outputs["session_edge_case"], batch.session_labels, ses_mask
             )

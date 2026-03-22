@@ -147,6 +147,8 @@ pub enum LLMVerdict {
     Fail,
     /// Skipped (e.g., Efficient mode for Mechanical priority).
     Skipped,
+    /// No LLM audit available (no provider configured, etc.).
+    Unavailable,
 }
 
 // ---------------------------------------------------------------------------

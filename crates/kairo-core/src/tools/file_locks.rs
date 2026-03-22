@@ -57,6 +57,31 @@ pub enum FileLockError {
 }
 
 // ---------------------------------------------------------------------------
+// Path canonicalization
+// ---------------------------------------------------------------------------
+
+/// Canonicalize a path for use as a DashMap key, ensuring that different
+/// string representations of the same filesystem location resolve to the
+/// same key. For paths that do not yet exist on disk, canonicalizes the
+/// parent directory and appends the file name.
+fn canonical_key(path: &Path) -> PathBuf {
+    match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // Non-existent file: canonicalize parent + append name
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                parent
+                    .canonicalize()
+                    .map(|p| p.join(name))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            } else {
+                path.to_path_buf()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FileLockTable
 // ---------------------------------------------------------------------------
 
@@ -85,8 +110,9 @@ impl FileLockTable {
     /// - `AlreadyOwned` if `track` already holds this lock.
     /// - `Blocked(other)` if another track holds the lock.
     pub fn acquire(&self, path: &Path, track: TrackId) -> LockResult {
+        let key = canonical_key(path);
         // Try to insert atomically. DashMap::entry provides the CAS semantics.
-        match self.locks.entry(path.to_path_buf()) {
+        match self.locks.entry(key) {
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(track);
                 debug!(path = %path.display(), track, "file lock acquired");
@@ -113,7 +139,8 @@ impl FileLockTable {
     ///
     /// No-op if the lock is not held or held by a different track.
     pub fn release(&self, path: &Path, track: TrackId) {
-        self.locks.remove_if(path, |_, holder| {
+        let key = canonical_key(path);
+        self.locks.remove_if(&key, |_, holder| {
             if *holder == track {
                 debug!(path = %path.display(), track, "file lock released");
                 true
@@ -124,20 +151,26 @@ impl FileLockTable {
     }
 
     /// Release all locks held by `track`.
+    ///
+    /// Uses collect-then-remove instead of `retain` to avoid potential
+    /// deadlocks from holding DashMap shard locks during iteration.
     pub fn release_all(&self, track: TrackId) {
-        self.locks.retain(|path, &mut holder| {
-            if holder == track {
-                debug!(path = %path.display(), track, "file lock released (release_all)");
-                false // remove this entry
-            } else {
-                true // keep
-            }
-        });
+        let keys_to_remove: Vec<PathBuf> = self
+            .locks
+            .iter()
+            .filter(|entry| *entry.value() == track)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys_to_remove {
+            debug!(path = %key.display(), track, "file lock released (release_all)");
+            self.locks.remove_if(&key, |_, v| *v == track);
+        }
     }
 
     /// Query which track (if any) holds the lock on `path`.
     pub fn held_by(&self, path: &Path) -> Option<TrackId> {
-        self.locks.get(path).map(|entry| *entry.value())
+        let key = canonical_key(path);
+        self.locks.get(&key).map(|entry| *entry.value())
     }
 
     /// List all file paths currently locked by `track`.
@@ -163,6 +196,56 @@ impl FileLockTable {
 impl Default for FileLockTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAII lock guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that automatically releases a file lock when dropped.
+///
+/// Obtained via [`FileLockTable::acquire_guard`]. The lock is released
+/// in the `Drop` implementation, so callers cannot accidentally forget
+/// to release it — even in the presence of early returns or panics.
+pub struct FileLockGuard<'a> {
+    table: &'a FileLockTable,
+    path: PathBuf,
+    track: TrackId,
+}
+
+impl FileLockGuard<'_> {
+    /// The canonical path this guard protects.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The track that owns this lock.
+    pub fn track(&self) -> TrackId {
+        self.track
+    }
+}
+
+impl Drop for FileLockGuard<'_> {
+    fn drop(&mut self) {
+        self.table.release(&self.path, self.track);
+    }
+}
+
+impl FileLockTable {
+    /// Acquire a file lock and return an RAII guard that releases it on drop.
+    ///
+    /// Returns `Ok(FileLockGuard)` if the lock was acquired (or already owned),
+    /// or `Err(LockResult::Blocked(other))` if another track holds the lock.
+    pub fn acquire_guard(&self, path: &Path, track: TrackId) -> Result<FileLockGuard<'_>, LockResult> {
+        match self.acquire(path, track) {
+            LockResult::Acquired | LockResult::AlreadyOwned => Ok(FileLockGuard {
+                table: self,
+                path: canonical_key(path),
+                track,
+            }),
+            other => Err(other),
+        }
     }
 }
 

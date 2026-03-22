@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "Core engine for KAIRO-X enforcement agent: arena graph, verification, context engine, enforcement, parallel execution"
 
+[features]
+default = []
+## Enable the neural classifier (requires a trained model binary).
+neural_classify = []
+
 [dependencies]
 # Internal
 kairo-llm = { path = "../kairo-llm" }

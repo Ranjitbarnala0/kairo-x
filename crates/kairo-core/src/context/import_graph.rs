@@ -9,7 +9,7 @@
 //! context ranking — false positives are cheap (slightly lower precision in
 //! candidate scoring), while the speed benefit is large.
 
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -29,8 +29,11 @@ static JS_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches Rust `use` statements: `use crate::foo::bar;` or `use super::baz;`
+///
+/// Uses `(?ms)` (multi-line + dotall) so grouped imports spanning multiple
+/// lines like `use crate::foo::{Bar,\n    Baz};` are captured as one match.
 static RUST_USE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*use\s+((?:crate|super|self|[a-zA-Z_][a-zA-Z0-9_]*)(?:::[a-zA-Z_*{][a-zA-Z0-9_:*{}, ]*)?)\s*;")
+    Regex::new(r"(?ms)^\s*use\s+((?:crate|super|self|[a-zA-Z_][a-zA-Z0-9_]*)(?:::[a-zA-Z_*{][a-zA-Z0-9_:*{}, \n\r]*)?)\s*;")
         .expect("Rust use regex must compile")
 });
 
@@ -40,9 +43,25 @@ static PYTHON_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Python import regex must compile")
 });
 
-/// Matches Go imports: `import "path"` and grouped imports
+/// Matches Go single-line imports: `import "path"`
 static GO_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)"([a-zA-Z0-9_./-]+)""#).expect("Go import regex must compile")
+    Regex::new(r#"(?m)^\s*import\s+"([a-zA-Z0-9_./-]+)""#).expect("Go import regex must compile")
+});
+
+/// Matches Go grouped import blocks: `import ( ... )`
+static GO_IMPORT_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?ms)^\s*import\s*\((.*?)\)"#).expect("Go import block regex must compile")
+});
+
+/// Extracts quoted paths within a Go import block.
+static GO_IMPORT_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""([a-zA-Z0-9_./-]+)""#).expect("Go import path regex must compile")
+});
+
+/// Matches JS/TS re-exports: `export { ... } from "..."` and `export * from "..."`
+static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"](\.{1,2}/[^'"]+)['"]"#)
+        .expect("JS re-export regex must compile")
 });
 
 /// Matches C/C++ includes: `#include "file.h"` and `#include <file.h>`
@@ -115,14 +134,14 @@ impl Language {
 
 /// Bidirectional import graph: maps file hashes to their import edges.
 ///
-/// `imports[A]` = list of file hashes that A imports.
-/// `imported_by[B]` = list of file hashes that import B.
+/// `imports[A]` = set of file hashes that A imports.
+/// `imported_by[B]` = set of file hashes that import B.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportGraph {
     /// file_hash → hashes of files it imports.
-    pub imports: FnvHashMap<u64, Vec<u64>>,
+    pub imports: FnvHashMap<u64, FnvHashSet<u64>>,
     /// file_hash → hashes of files that import it.
-    pub imported_by: FnvHashMap<u64, Vec<u64>>,
+    pub imported_by: FnvHashMap<u64, FnvHashSet<u64>>,
 }
 
 impl ImportGraph {
@@ -133,27 +152,21 @@ impl ImportGraph {
 
     /// Add a directed edge: `from_hash` imports `to_hash`.
     ///
-    /// Maintains both the forward and reverse maps. Deduplicates edges.
+    /// Maintains both the forward and reverse maps. Deduplication is O(1)
+    /// via `FnvHashSet::insert`.
     pub fn add_edge(&mut self, from_hash: u64, to_hash: u64) {
-        let fwd = self.imports.entry(from_hash).or_default();
-        if !fwd.contains(&to_hash) {
-            fwd.push(to_hash);
-        }
-
-        let rev = self.imported_by.entry(to_hash).or_default();
-        if !rev.contains(&from_hash) {
-            rev.push(from_hash);
-        }
+        self.imports.entry(from_hash).or_default().insert(to_hash);
+        self.imported_by.entry(to_hash).or_default().insert(from_hash);
     }
 
     /// Remove all edges originating from `from_hash` (used before re-scanning a file).
     pub fn remove_outgoing(&mut self, from_hash: u64) {
         if let Some(targets) = self.imports.remove(&from_hash) {
-            for target in &targets {
-                if let Some(rev) = self.imported_by.get_mut(target) {
-                    rev.retain(|&h| h != from_hash);
+            for &target in &targets {
+                if let Some(rev) = self.imported_by.get_mut(&target) {
+                    rev.remove(&from_hash);
                     if rev.is_empty() {
-                        self.imported_by.remove(target);
+                        self.imported_by.remove(&target);
                     }
                 }
             }
@@ -161,13 +174,15 @@ impl ImportGraph {
     }
 
     /// Get the direct imports of a file (files it depends on).
-    pub fn imports_of(&self, file_hash: u64) -> &[u64] {
-        self.imports.get(&file_hash).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn imports_of(&self, file_hash: u64) -> &FnvHashSet<u64> {
+        static EMPTY: LazyLock<FnvHashSet<u64>> = LazyLock::new(FnvHashSet::default);
+        self.imports.get(&file_hash).unwrap_or(&EMPTY)
     }
 
     /// Get the files that import a given file (reverse dependencies).
-    pub fn importers_of(&self, file_hash: u64) -> &[u64] {
-        self.imported_by.get(&file_hash).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn importers_of(&self, file_hash: u64) -> &FnvHashSet<u64> {
+        static EMPTY: LazyLock<FnvHashSet<u64>> = LazyLock::new(FnvHashSet::default);
+        self.imported_by.get(&file_hash).unwrap_or(&EMPTY)
     }
 
     /// Return all neighbors of a file: both its imports and its importers.
@@ -292,6 +307,12 @@ fn extract_js_imports(content: &str) -> Vec<String> {
             results.push(m.as_str().to_string());
         }
     }
+    // Also capture re-exports: `export { ... } from "..."` and `export * from "..."`
+    for caps in JS_REEXPORT_RE.captures_iter(content) {
+        if let Some(m) = caps.get(1) {
+            results.push(m.as_str().to_string());
+        }
+    }
     results
 }
 
@@ -317,11 +338,25 @@ fn extract_python_imports(content: &str) -> Vec<String> {
 
 fn extract_go_imports(content: &str) -> Vec<String> {
     let mut results = Vec::new();
+
+    // Single-line imports: `import "fmt"`
     for caps in GO_IMPORT_RE.captures_iter(content) {
         if let Some(m) = caps.get(1) {
             results.push(m.as_str().to_string());
         }
     }
+
+    // Grouped import blocks: `import ( "fmt"\n "net/http" )`
+    for block_caps in GO_IMPORT_BLOCK_RE.captures_iter(content) {
+        if let Some(block_body) = block_caps.get(1) {
+            for path_caps in GO_IMPORT_PATH_RE.captures_iter(block_body.as_str()) {
+                if let Some(m) = path_caps.get(1) {
+                    results.push(m.as_str().to_string());
+                }
+            }
+        }
+    }
+
     results
 }
 
@@ -408,6 +443,8 @@ fn resolve_import_path_with_set(
 }
 
 /// Build a list of possible file paths that a raw import might refer to.
+///
+/// Returns an empty list if path normalization fails (e.g. traversal past root).
 fn build_resolution_candidates(importer_dir: &str, raw_import: &str) -> Vec<String> {
     let mut candidates = Vec::new();
 
@@ -423,7 +460,11 @@ fn build_resolution_candidates(importer_dir: &str, raw_import: &str) -> Vec<Stri
     };
 
     // Normalize path components (remove ../ and ./)
-    let normalized = normalize_path(&base);
+    // If normalization fails (traversal past root), return empty candidates.
+    let normalized = match normalize_path(&base) {
+        Some(n) => n,
+        None => return candidates,
+    };
     candidates.push(normalized.clone());
 
     // Try common extensions
@@ -448,13 +489,19 @@ fn build_resolution_candidates(importer_dir: &str, raw_import: &str) -> Vec<Stri
 }
 
 /// Simplistic path normalization: collapse `.` and `..` components.
-fn normalize_path(path: &str) -> String {
+///
+/// Returns `None` if the path traverses past the root (more `..` than
+/// real components), which indicates a malformed or adversarial import.
+fn normalize_path(path: &str) -> Option<String> {
     let mut components: Vec<&str> = Vec::new();
 
     for part in path.split('/') {
         match part {
             "" | "." => {}
             ".." => {
+                if components.is_empty() {
+                    return None; // would go above root
+                }
                 components.pop();
             }
             other => {
@@ -463,7 +510,11 @@ fn normalize_path(path: &str) -> String {
         }
     }
 
-    components.join("/")
+    if components.is_empty() {
+        return None;
+    }
+
+    Some(components.join("/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -601,9 +652,14 @@ import (
         g.add_edge(1, 3);
         g.add_edge(4, 2);
 
-        assert_eq!(g.imports_of(1), &[2, 3]);
-        assert_eq!(g.importers_of(2), &[1, 4]);
-        assert_eq!(g.imports_of(4), &[2]);
+        let imports_1: HashSet<u64> = g.imports_of(1).iter().copied().collect();
+        assert_eq!(imports_1, HashSet::from([2, 3]));
+
+        let importers_2: HashSet<u64> = g.importers_of(2).iter().copied().collect();
+        assert_eq!(importers_2, HashSet::from([1, 4]));
+
+        assert!(g.imports_of(4).contains(&2));
+        assert_eq!(g.imports_of(4).len(), 1);
         assert!(g.imports_of(99).is_empty());
     }
 
@@ -629,7 +685,8 @@ import (
 
         assert!(g.imports_of(1).is_empty());
         // 2 should only be imported by 4 now
-        assert_eq!(g.importers_of(2), &[4]);
+        assert!(g.importers_of(2).contains(&4));
+        assert_eq!(g.importers_of(2).len(), 1);
         // 3 should have no importers
         assert!(g.importers_of(3).is_empty());
     }
@@ -705,10 +762,24 @@ import (
 
     #[test]
     fn test_normalize_path() {
-        assert_eq!(normalize_path("src/../lib/foo"), "lib/foo");
-        assert_eq!(normalize_path("./src/./utils"), "src/utils");
-        assert_eq!(normalize_path("a/b/../c"), "a/c");
-        assert_eq!(normalize_path("a/b/c"), "a/b/c");
+        assert_eq!(normalize_path("src/../lib/foo"), Some("lib/foo".to_string()));
+        assert_eq!(normalize_path("./src/./utils"), Some("src/utils".to_string()));
+        assert_eq!(normalize_path("a/b/../c"), Some("a/c".to_string()));
+        assert_eq!(normalize_path("a/b/c"), Some("a/b/c".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_traversal_past_root() {
+        assert_eq!(normalize_path("../escape"), None);
+        assert_eq!(normalize_path("a/../../escape"), None);
+        assert_eq!(normalize_path(".."), None);
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_empty_result() {
+        assert_eq!(normalize_path(""), None);
+        assert_eq!(normalize_path("."), None);
+        assert_eq!(normalize_path("a/.."), None);
     }
 
     // -- Resolution --

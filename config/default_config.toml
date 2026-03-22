@@ -106,9 +106,9 @@ checkpoint_interval = 10
 max_checkpoints = 20
 
 [budget]
-# Optional token budget limit in tokens (0 = unlimited)
-# token_limit = 0
-# Optional cost budget limit in microdollars (0 = unlimited)
-# cost_limit_microdollars = 0
+# Token budget limit (0 = unlimited)
+token_limit = 10_000_000
+# Cost budget limit in microdollars (0 = unlimited)
+cost_limit_microdollars = 10_000_000
 # Warn when budget usage reaches this percentage
 warn_threshold_percent = 80

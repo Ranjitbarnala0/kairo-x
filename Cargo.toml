@@ -16,11 +16,11 @@ authors = ["KAIRO-X Contributors"]
 [workspace.dependencies]
 # Concurrency
 dashmap = "6"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "process", "signal", "fs"] }
 crossbeam-channel = "0.5"
 
 # Data structures
-smallvec = { version = "1", features = ["serde", "write", "union"] }
+smallvec = { version = "1", features = ["serde", "write"] }
 bitvec = { version = "1", features = ["serde"] }
 compact_str = { version = "0.8", features = ["serde"] }
 
@@ -53,7 +53,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Misc
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 libc = "0.2"

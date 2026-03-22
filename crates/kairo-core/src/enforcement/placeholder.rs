@@ -3,6 +3,8 @@
 //! Uses the compiled regex patterns from [`classify::patterns`] to scan code
 //! for placeholder/stub patterns and report matches with line numbers.
 
+use std::collections::BTreeMap;
+
 use crate::classify::patterns::{
     self, CompiledPattern, Language, UNIVERSAL_PLACEHOLDER_PATTERNS,
 };
@@ -68,10 +70,16 @@ pub fn detect_placeholders(code: &str, language: Language) -> Vec<PlaceholderMat
         check_patterns(line, line_number, language_specific, &mut matches);
     }
 
-    // Deduplicate by line number (keep first match per line)
-    matches.dedup_by_key(|m| m.line_number);
+    // Deduplicate by line number (keep first match per line).
+    // Using BTreeMap guarantees uniqueness regardless of input ordering,
+    // unlike dedup_by_key which only removes *consecutive* duplicates.
+    let mut seen: BTreeMap<usize, PlaceholderMatch> = BTreeMap::new();
+    for m in matches {
+        // First-wins: preserve the higher-priority pattern that matched first.
+        seen.entry(m.line_number).or_insert(m);
+    }
 
-    matches
+    seen.into_values().collect()
 }
 
 /// Detect placeholders with automatic language inference from file path.

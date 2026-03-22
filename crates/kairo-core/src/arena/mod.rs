@@ -8,7 +8,21 @@ use fnv::FnvHashMap;
 use node::{Node, NodeStatus};
 use priority_queue::{PendingEntry, PriorityQueue};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// ArenaError — typed errors for arena operations
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ArenaError {
+    #[error("Step counter overflow at u32::MAX")]
+    StepOverflow,
+
+    #[error("Cyclic dependency detected: adding edge {from} -> {to} would create a cycle")]
+    CyclicDependency { from: u32, to: u32 },
+}
 
 // ---------------------------------------------------------------------------
 // Arena — the core execution graph data structure
@@ -20,7 +34,7 @@ use std::collections::HashMap;
 /// per node (no separate edge array). Free list enables O(1) node recycling.
 ///
 /// Indices provide fast lookup:
-/// - `title_index`: FNV hash of title → node index
+/// - `title_index`: actual title string → node index (collision-free)
 /// - `path_index`: FNV hash of file path → node indices touching that file
 #[derive(Debug)]
 pub struct Arena {
@@ -28,8 +42,8 @@ pub struct Arena {
     pub(crate) nodes: Vec<Node>,
     /// Free list of deallocated node indices for reuse.
     pub(crate) free_list: Vec<u32>,
-    /// FNV hash of title → node index for fast title lookup.
-    pub(crate) title_index: FnvHashMap<u64, u32>,
+    /// Title string → node index for collision-free title lookup.
+    pub(crate) title_index: HashMap<String, u32>,
     /// FNV hash of file path → node indices that touch that file.
     pub(crate) path_index: FnvHashMap<u64, Vec<u32>>,
     /// Priority queue for pending nodes with resolved dependencies.
@@ -50,7 +64,7 @@ impl Arena {
         let mut arena = Self {
             nodes: Vec::with_capacity(256),
             free_list: Vec::new(),
-            title_index: FnvHashMap::default(),
+            title_index: HashMap::new(),
             path_index: FnvHashMap::default(),
             pending_queue: PriorityQueue::new(),
             itch: ItchRegister::new(),
@@ -82,9 +96,9 @@ impl Arena {
         // Set itch bit — this node needs to be resolved
         self.itch.set(idx as usize);
 
-        // Update title index
-        let title_hash = fnv_hash(self.nodes[idx as usize].title.as_str());
-        self.title_index.insert(title_hash, idx);
+        // Update title index (store actual title string, no hash collisions)
+        let title_str = self.nodes[idx as usize].title.to_string();
+        self.title_index.insert(title_str, idx);
 
         // Update path index for impl_files
         for &file_hash in &self.nodes[idx as usize].impl_files {
@@ -106,17 +120,25 @@ impl Arena {
             return;
         }
 
+        // Double-dealloc guard: silently ignore if already deallocated
+        if self.nodes[idx as usize].status == NodeStatus::Deallocated {
+            return;
+        }
+
         // Clear itch bit
         self.itch.clear(idx as usize);
 
-        // Remove from title index
-        let title_hash = fnv_hash(self.nodes[idx as usize].title.as_str());
-        self.title_index.remove(&title_hash);
+        // Remove from title index (by actual title string)
+        let title_str = self.nodes[idx as usize].title.to_string();
+        self.title_index.remove(&title_str);
 
-        // Remove from path index
+        // Remove from path index, cleaning up empty entries
         for &file_hash in &self.nodes[idx as usize].impl_files {
             if let Some(entries) = self.path_index.get_mut(&file_hash) {
                 entries.retain(|&i| i != idx);
+                if entries.is_empty() {
+                    self.path_index.remove(&file_hash);
+                }
             }
         }
 
@@ -126,18 +148,37 @@ impl Arena {
     }
 
     /// Get an immutable reference to a node.
-    pub fn get(&self, idx: u32) -> &Node {
-        &self.nodes[idx as usize]
+    ///
+    /// Returns `None` if the index is out of bounds, is the root sentinel,
+    /// or the node has been deallocated.
+    pub fn get(&self, idx: u32) -> Option<&Node> {
+        if idx == 0 || idx as usize >= self.nodes.len() {
+            return None;
+        }
+        let node = &self.nodes[idx as usize];
+        if node.status == NodeStatus::Deallocated {
+            return None;
+        }
+        Some(node)
     }
 
     /// Get a mutable reference to a node.
-    pub fn get_mut(&mut self, idx: u32) -> &mut Node {
-        &mut self.nodes[idx as usize]
+    ///
+    /// Returns `None` if the index is out of bounds, is the root sentinel,
+    /// or the node has been deallocated.
+    pub fn get_mut(&mut self, idx: u32) -> Option<&mut Node> {
+        if idx == 0 || idx as usize >= self.nodes.len() {
+            return None;
+        }
+        if self.nodes[idx as usize].status == NodeStatus::Deallocated {
+            return None;
+        }
+        Some(&mut self.nodes[idx as usize])
     }
 
     /// Total number of live (non-deallocated) nodes, excluding root.
     pub fn live_count(&self) -> usize {
-        self.nodes.len() - 1 - self.free_list.len()
+        self.nodes.len().saturating_sub(1).saturating_sub(self.free_list.len())
     }
 
     /// Store the full specification text for a node.
@@ -165,9 +206,13 @@ impl Arena {
     }
 
     /// Advance the step counter and return the new step number.
-    pub fn advance_step(&mut self) -> u32 {
-        self.current_step += 1;
-        self.current_step
+    ///
+    /// Returns `Err(ArenaError::StepOverflow)` if the counter would exceed `u32::MAX`.
+    pub fn advance_step(&mut self) -> Result<u32, ArenaError> {
+        self.current_step = self.current_step
+            .checked_add(1)
+            .ok_or(ArenaError::StepOverflow)?;
+        Ok(self.current_step)
     }
 
     /// Mark a node as complete. Clears its itch bit.
@@ -211,7 +256,20 @@ impl Arena {
     }
 
     /// Add a dependency edge: `node_idx` depends on `dep_idx`.
-    pub fn add_dependency(&mut self, node_idx: u32, dep_idx: u32) {
+    ///
+    /// Performs a BFS reachability check to ensure adding this edge would not
+    /// create a cycle in the dependency graph. Returns `Err(ArenaError::CyclicDependency)`
+    /// if `dep_idx` is reachable from `node_idx` via existing dependency edges.
+    pub fn add_dependency(&mut self, node_idx: u32, dep_idx: u32) -> Result<(), ArenaError> {
+        // Cycle detection: check that dep_idx is NOT reachable from node_idx.
+        // If it is, adding node_idx -> dep_idx would create a cycle.
+        if self.is_reachable_via_dependencies(dep_idx, node_idx) {
+            return Err(ArenaError::CyclicDependency {
+                from: node_idx,
+                to: dep_idx,
+            });
+        }
+
         let node = &mut self.nodes[node_idx as usize];
         if !node.dependencies.contains(&dep_idx) {
             node.dependencies.push(dep_idx);
@@ -221,11 +279,39 @@ impl Arena {
         if !dep_node.dependents.contains(&node_idx) {
             dep_node.dependents.push(node_idx);
         }
+
+        Ok(())
+    }
+
+    /// BFS reachability check: returns true if `target` is reachable from `start`
+    /// by following dependency edges (i.e., each node's `dependencies` list).
+    fn is_reachable_via_dependencies(&self, start: u32, target: u32) -> bool {
+        if start == target {
+            return true;
+        }
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+
+        while let Some(current) = queue.pop_front() {
+            for &dep in &self.nodes[current as usize].dependencies {
+                if dep == target {
+                    return true;
+                }
+                if visited.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+        false
     }
 
     /// Add a parent-child relationship: `child_idx` is a child of `parent_idx`.
     pub fn add_child(&mut self, parent_idx: u32, child_idx: u32) {
-        self.nodes[parent_idx as usize].children.push(child_idx);
+        if !self.nodes[parent_idx as usize].children.contains(&child_idx) {
+            self.nodes[parent_idx as usize].children.push(child_idx);
+        }
         self.nodes[child_idx as usize].parent = parent_idx;
     }
 
@@ -249,10 +335,9 @@ impl Arena {
             .map(|(i, n)| (i as u32, n))
     }
 
-    /// Find a node by title.
+    /// Find a node by title (exact match, collision-free).
     pub fn find_by_title(&self, title: &str) -> Option<u32> {
-        let hash = fnv_hash(title);
-        self.title_index.get(&hash).copied()
+        self.title_index.get(title).copied()
     }
 
     /// Find all nodes that touch a given file path.
@@ -298,7 +383,7 @@ mod tests {
         let node = Node::new("Test node".to_string(), Priority::Standard);
         let idx = arena.alloc(node);
 
-        assert_eq!(arena.get(idx).title.as_str(), "Test node");
+        assert_eq!(arena.get(idx).expect("node must exist").title.as_str(), "Test node");
         assert_eq!(arena.live_count(), 1);
         assert!(!arena.can_terminate()); // itch bit is set
     }
@@ -326,7 +411,7 @@ mod tests {
         // Allocating again should reuse the freed slot
         let n3 = arena.alloc(Node::new("C".to_string(), Priority::Standard));
         assert_eq!(n3, n1); // reused index
-        assert_eq!(arena.get(n3).title.as_str(), "C");
+        assert_eq!(arena.get(n3).expect("node must exist").title.as_str(), "C");
     }
 
     #[test]
@@ -335,7 +420,7 @@ mod tests {
         let n1 = arena.alloc(Node::new("Dep".to_string(), Priority::Critical));
         let n2 = arena.alloc(Node::new("Dependent".to_string(), Priority::Standard));
 
-        arena.add_dependency(n2, n1);
+        arena.add_dependency(n2, n1).expect("no cycle");
 
         assert!(!arena.are_dependencies_resolved(n2));
         arena.mark_complete(n1);

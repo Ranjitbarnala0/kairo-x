@@ -148,35 +148,104 @@ impl Arena {
         }
     }
 
-    /// Get the critical path — the longest dependency chain from any pending
-    /// node to any leaf (node with no dependents). Returns the chain as indices.
+    /// Get the critical path -- the longest weighted path through the
+    /// non-terminal portion of the dependency DAG. Returns an ordered
+    /// path from root dependency to leaf (inclusive).
+    ///
+    /// Uses Kahn's algorithm to produce a topological order, then
+    /// relaxes edges to find the longest path (standard DAG longest-path
+    /// in O(V + E)).
     pub fn critical_path(&self) -> Vec<u32> {
-        let mut longest: Vec<u32> = Vec::new();
+        use std::collections::VecDeque;
 
-        // Find all leaf nodes (no unresolved dependents)
-        let leaves: Vec<u32> = self
+        // Collect live (non-terminal) node indices.
+        let live: Vec<u32> = self
             .nodes
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(_, n)| {
-                !n.status.is_terminal()
-                    && n.dependents
-                        .iter()
-                        .all(|&d| self.nodes[d as usize].status.is_terminal())
-            })
+            .filter(|(_, n)| !n.status.is_terminal())
             .map(|(i, _)| i as u32)
             .collect();
 
-        for leaf in leaves {
-            let chain = self.dependency_chain(leaf);
-            if chain.len() > longest.len() {
-                longest = chain;
-                longest.push(leaf);
+        if live.is_empty() {
+            return Vec::new();
+        }
+
+        let max_idx = self.nodes.len();
+        // in_degree restricted to the live subgraph
+        let mut in_degree = vec![0u32; max_idx];
+        let mut is_live = vec![false; max_idx];
+        for &idx in &live {
+            is_live[idx as usize] = true;
+        }
+        for &idx in &live {
+            for &dep in &self.nodes[idx as usize].dependencies {
+                if is_live[dep as usize] {
+                    in_degree[idx as usize] += 1;
+                }
             }
         }
 
-        longest
+        // Kahn's topological sort over the live subgraph
+        let mut queue = VecDeque::new();
+        for &idx in &live {
+            if in_degree[idx as usize] == 0 {
+                queue.push_back(idx);
+            }
+        }
+
+        let mut topo_order = Vec::with_capacity(live.len());
+        while let Some(idx) = queue.pop_front() {
+            topo_order.push(idx);
+            for &dep_idx in &self.nodes[idx as usize].dependents {
+                if !is_live[dep_idx as usize] {
+                    continue;
+                }
+                in_degree[dep_idx as usize] -= 1;
+                if in_degree[dep_idx as usize] == 0 {
+                    queue.push_back(dep_idx);
+                }
+            }
+        }
+
+        // Longest-path relaxation (each node has weight 1).
+        let mut dist = vec![0u32; max_idx];
+        let mut predecessor: Vec<Option<u32>> = vec![None; max_idx];
+
+        for &idx in &topo_order {
+            for &dep_idx in &self.nodes[idx as usize].dependents {
+                if !is_live[dep_idx as usize] {
+                    continue;
+                }
+                let new_dist = dist[idx as usize] + 1;
+                if new_dist > dist[dep_idx as usize] {
+                    dist[dep_idx as usize] = new_dist;
+                    predecessor[dep_idx as usize] = Some(idx);
+                }
+            }
+        }
+
+        // Find the node with the maximum distance (end of critical path).
+        let end_node = live
+            .iter()
+            .copied()
+            .max_by_key(|&idx| dist[idx as usize]);
+
+        let end_node = match end_node {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+
+        // Trace back from end to start via predecessors.
+        let mut path = Vec::new();
+        let mut current = Some(end_node);
+        while let Some(idx) = current {
+            path.push(idx);
+            current = predecessor[idx as usize];
+        }
+        path.reverse();
+        path
     }
 }
 
@@ -192,14 +261,21 @@ impl Arena {
     }
 
     /// Get all descendant nodes (transitive children).
+    ///
+    /// Uses a visited set to protect against cycles in the child graph
+    /// (which should not occur in a well-formed tree but guards against corruption).
     pub fn descendants(&self, node_idx: u32) -> Vec<u32> {
         let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(node_idx);
         let mut stack = vec![node_idx];
 
         while let Some(idx) = stack.pop() {
             for &child in &self.nodes[idx as usize].children {
-                result.push(child);
-                stack.push(child);
+                if visited.insert(child) {
+                    result.push(child);
+                    stack.push(child);
+                }
             }
         }
 
@@ -207,12 +283,22 @@ impl Arena {
     }
 
     /// Get the depth of a node in the tree (root = 0).
+    ///
+    /// Bounded to a maximum depth of 1000 to prevent infinite loops if the
+    /// parent chain contains a cycle due to corruption.
     pub fn depth(&self, node_idx: u32) -> u32 {
-        let mut depth = 0;
+        const MAX_DEPTH: u32 = 1000;
+        let mut depth = 0u32;
         let mut current = node_idx;
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current);
 
-        while current != 0 {
+        while current != 0 && depth < MAX_DEPTH {
             current = self.nodes[current as usize].parent;
+            if !visited.insert(current) {
+                // Cycle detected in parent chain -- break to prevent infinite loop
+                break;
+            }
             depth += 1;
         }
 
@@ -354,8 +440,8 @@ mod tests {
         let b = arena.alloc(Node::new("B".to_string(), Priority::Standard));
         let c = arena.alloc(Node::new("C".to_string(), Priority::Mechanical));
 
-        arena.add_dependency(b, a);
-        arena.add_dependency(c, b);
+        arena.add_dependency(b, a).expect("no cycle");
+        arena.add_dependency(c, b).expect("no cycle");
 
         arena
     }
@@ -367,7 +453,7 @@ mod tests {
         let ready = arena.nodes_ready();
         // Only A should be ready (no dependencies)
         assert_eq!(ready.len(), 1);
-        assert_eq!(arena.get(ready[0]).title.as_str(), "A");
+        assert_eq!(arena.get(ready[0]).expect("node must exist").title.as_str(), "A");
     }
 
     #[test]

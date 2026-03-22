@@ -43,7 +43,7 @@ impl ItchRegister {
             self.bits.resize(idx + 1, false);
         }
         if !self.bits[idx] {
-            self.count += 1;
+            self.count = self.count.saturating_add(1);
             self.bits.set(idx, true);
         }
     }
@@ -51,7 +51,7 @@ impl ItchRegister {
     /// Clear an itch bit (mark a node as resolved).
     pub fn clear(&mut self, idx: usize) {
         if idx < self.bits.len() && self.bits[idx] {
-            self.count -= 1;
+            self.count = self.count.saturating_sub(1);
             self.bits.set(idx, false);
         }
     }
@@ -111,8 +111,14 @@ impl ItchRegister {
         };
         // Ensure correct length
         register.bits.resize(bit_len, false);
-        // Recompute count from bits
-        register.count = register.bits.count_ones() as u32;
+        // Recompute count from bits — safe cast with debug assertion
+        let ones = register.bits.count_ones();
+        debug_assert!(
+            ones <= u32::MAX as usize,
+            "itch register has more than u32::MAX active bits: {}",
+            ones
+        );
+        register.count = ones.min(u32::MAX as usize) as u32;
         register
     }
 }

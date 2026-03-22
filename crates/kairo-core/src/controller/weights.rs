@@ -11,6 +11,15 @@ use std::path::Path;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Magic number for weight file validation ("KAIR" in ASCII).
+/// Must appear as the first 4 bytes of weights.bin to confirm correct
+/// endianness and file integrity.
+const WEIGHT_MAGIC: [u8; 4] = [0x4B, 0x41, 0x49, 0x52];
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -34,6 +43,16 @@ pub enum WeightError {
 
     #[error("Weight file corrupted: {0}")]
     Corrupted(String),
+
+    #[error(
+        "Weight file magic mismatch: expected {expected:02X?}, got {actual:02X?}. \
+         This indicates endianness mismatch, file corruption, or an \
+         incompatible weight format."
+    )]
+    MagicMismatch {
+        expected: [u8; 4],
+        actual: [u8; 4],
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -114,19 +133,27 @@ impl Tensor {
     }
 
     /// Get a slice for 2D matrix row access: tensor[row, :]
-    pub fn row(&self, row: usize) -> &[f32] {
-        assert!(self.shape.len() == 2, "row() requires 2D tensor");
+    ///
+    /// Returns `None` if the tensor is not 2D or the row index is out of range.
+    pub fn row(&self, i: usize) -> Option<&[f32]> {
+        if self.shape.len() != 2 || i >= self.shape[0] {
+            return None;
+        }
         let cols = self.shape[1];
-        let start = row * cols;
-        &self.data[start..start + cols]
+        let start = i * cols;
+        self.data.get(start..start + cols)
     }
 
     /// Mutable row access.
-    pub fn row_mut(&mut self, row: usize) -> &mut [f32] {
-        assert!(self.shape.len() == 2, "row_mut() requires 2D tensor");
+    ///
+    /// Returns `None` if the tensor is not 2D or the row index is out of range.
+    pub fn row_mut(&mut self, i: usize) -> Option<&mut [f32]> {
+        if self.shape.len() != 2 || i >= self.shape[0] {
+            return None;
+        }
         let cols = self.shape[1];
-        let start = row * cols;
-        &mut self.data[start..start + cols]
+        let start = i * cols;
+        self.data.get_mut(start..start + cols)
     }
 }
 
@@ -157,6 +184,31 @@ impl WeightStore {
         let mut weight_file = std::fs::File::open(&weights_path)?;
         let mut weight_data = Vec::new();
         weight_file.read_to_end(&mut weight_data)?;
+
+        // Validate magic number (first 4 bytes must be "KAIR")
+        if weight_data.len() < WEIGHT_MAGIC.len() {
+            return Err(WeightError::Corrupted(format!(
+                "Weight file too small ({} bytes), expected at least {} bytes for magic header",
+                weight_data.len(),
+                WEIGHT_MAGIC.len(),
+            )));
+        }
+        let actual_magic: [u8; 4] = [
+            weight_data[0],
+            weight_data[1],
+            weight_data[2],
+            weight_data[3],
+        ];
+        if actual_magic != WEIGHT_MAGIC {
+            return Err(WeightError::MagicMismatch {
+                expected: WEIGHT_MAGIC,
+                actual: actual_magic,
+            });
+        }
+
+        // Advance past magic header — tensor offsets in the manifest are
+        // relative to the start of the data section (byte 4 onward).
+        let weight_data = &weight_data[WEIGHT_MAGIC.len()..];
 
         // Parse tensors
         let mut tensors = HashMap::new();
@@ -212,83 +264,179 @@ impl WeightStore {
             Tensor::zeros(&[config.d_model]),
         );
 
-        // Layer weights
+        // Layer weights — matching Python LiquidBlock structure exactly
         for layer_idx in 0..config.n_layers {
             let prefix = format!("layers.{layer_idx}");
 
-            // Band projections (4 bands)
-            for band in 0..config.n_bands {
-                let bp = format!("{prefix}.band_{band}");
+            // Input normalization: LayerNorm(d_model) — pre-norm before input_proj
+            tensors.insert(
+                format!("{prefix}.input_norm.weight"),
+                Tensor::ones(&[config.d_model]),
+            );
+            tensors.insert(
+                format!("{prefix}.input_norm.bias"),
+                Tensor::zeros(&[config.d_model]),
+            );
 
-                // GRU gate weights
+            // Input projection: Linear(d_model, n_bands * d_state)
+            let proj_out = config.n_bands * config.d_state;
+            tensors.insert(
+                format!("{prefix}.input_proj.weight"),
+                Tensor::zeros(&[proj_out, config.d_model]),
+            );
+            tensors.insert(
+                format!("{prefix}.input_proj.bias"),
+                Tensor::zeros(&[proj_out]),
+            );
+
+            // Per-band GRU weights (4 bands)
+            // Python: BandGRU(d_input=d_state, d_state=d_state)
+            //   W_input: Linear(d_state, 3*d_state)
+            //   W_state: Linear(d_state, 3*d_state)
+            for band in 0..config.n_bands {
+                let bp = format!("{prefix}.band_grus.{band}");
+
                 tensors.insert(
-                    format!("{bp}.gate_ih.weight"),
-                    Tensor::zeros(&[config.d_state * 3, config.d_model]),
-                );
-                tensors.insert(
-                    format!("{bp}.gate_ih.bias"),
-                    Tensor::zeros(&[config.d_state * 3]),
-                );
-                tensors.insert(
-                    format!("{bp}.gate_hh.weight"),
+                    format!("{bp}.W_input.weight"),
                     Tensor::zeros(&[config.d_state * 3, config.d_state]),
                 );
                 tensors.insert(
-                    format!("{bp}.gate_hh.bias"),
+                    format!("{bp}.W_input.bias"),
                     Tensor::zeros(&[config.d_state * 3]),
+                );
+                tensors.insert(
+                    format!("{bp}.W_state.weight"),
+                    Tensor::zeros(&[config.d_state * 3, config.d_state]),
+                );
+                tensors.insert(
+                    format!("{bp}.W_state.bias"),
+                    Tensor::zeros(&[config.d_state * 3]),
+                );
+
+                // Learnable initial state h0: [d_state]
+                tensors.insert(
+                    format!("{bp}.h0"),
+                    Tensor::zeros(&[config.d_state]),
                 );
             }
 
-            // Cross-band attention (matches Python CrossBandAttention):
-            // qkv: combined Q/K/V projection [3*d_state, d_state]
-            // out_proj: output projection [d_state, d_state]
+            // Cross-band normalization: LayerNorm(d_state) — pre-norm before attention
             tensors.insert(
-                format!("{prefix}.cross_band.qkv.weight"),
+                format!("{prefix}.cross_band_norm.weight"),
+                Tensor::ones(&[config.d_state]),
+            );
+            tensors.insert(
+                format!("{prefix}.cross_band_norm.bias"),
+                Tensor::zeros(&[config.d_state]),
+            );
+
+            // Cross-band attention (matches Python CrossBandAttention):
+            // qkv: Linear(d_state, 3*d_state, bias=False)
+            // out_proj: Linear(d_state, d_state, bias=False)
+            tensors.insert(
+                format!("{prefix}.cross_band_attn.qkv.weight"),
                 Tensor::zeros(&[config.d_state * 3, config.d_state]),
             );
             tensors.insert(
-                format!("{prefix}.cross_band.out_proj.weight"),
+                format!("{prefix}.cross_band_attn.out_proj.weight"),
                 Tensor::zeros(&[config.d_state, config.d_state]),
             );
 
-            // FFN
+            // Per-band FFN weights (4 bands)
+            // Python: Sequential(LayerNorm(d_state), Linear(d_state, d_state*2),
+            //         SiLU, Dropout, Linear(d_state*2, d_state), Dropout)
+            // Module indices: 0=LayerNorm, 1=Linear_up, 2=SiLU, 3=Dropout, 4=Linear_down, 5=Dropout
+            let d_band_ffn = config.d_state * 2;
+            for band in 0..config.n_bands {
+                let bp = format!("{prefix}.band_ffns.{band}");
+
+                // LayerNorm (index 0)
+                tensors.insert(
+                    format!("{bp}.0.weight"),
+                    Tensor::ones(&[config.d_state]),
+                );
+                tensors.insert(
+                    format!("{bp}.0.bias"),
+                    Tensor::zeros(&[config.d_state]),
+                );
+                // Linear up (index 1): d_state -> d_state*2
+                tensors.insert(
+                    format!("{bp}.1.weight"),
+                    Tensor::zeros(&[d_band_ffn, config.d_state]),
+                );
+                tensors.insert(
+                    format!("{bp}.1.bias"),
+                    Tensor::zeros(&[d_band_ffn]),
+                );
+                // Linear down (index 4): d_state*2 -> d_state
+                tensors.insert(
+                    format!("{bp}.4.weight"),
+                    Tensor::zeros(&[config.d_state, d_band_ffn]),
+                );
+                tensors.insert(
+                    format!("{bp}.4.bias"),
+                    Tensor::zeros(&[config.d_state]),
+                );
+            }
+
+            // Learned band FFN state scale (scalar, initialized to 0.1 in Python)
+            {
+                let mut scale_tensor = Tensor::zeros(&[1]);
+                scale_tensor.data[0] = 0.1;
+                tensors.insert(
+                    format!("{prefix}.band_ffn_state_scale"),
+                    scale_tensor,
+                );
+            }
+
+            // Band-to-model projection: Linear(n_bands * d_state, d_model)
+            let flat_dim = config.n_bands * config.d_state;
             tensors.insert(
-                format!("{prefix}.ffn.up.weight"),
-                Tensor::zeros(&[config.d_ffn, config.d_model]),
+                format!("{prefix}.band_to_model.weight"),
+                Tensor::zeros(&[config.d_model, flat_dim]),
             );
             tensors.insert(
-                format!("{prefix}.ffn.up.bias"),
-                Tensor::zeros(&[config.d_ffn]),
-            );
-            tensors.insert(
-                format!("{prefix}.ffn.down.weight"),
-                Tensor::zeros(&[config.d_model, config.d_ffn]),
-            );
-            tensors.insert(
-                format!("{prefix}.ffn.down.bias"),
+                format!("{prefix}.band_to_model.bias"),
                 Tensor::zeros(&[config.d_model]),
             );
 
-            // LayerNorms — gamma initialized to 1.0 (standard default),
-            // NOT zero. Zero gamma kills the signal entirely, making the
-            // controller produce constant output regardless of input.
+            // SwiGLU FFN normalization: LayerNorm(d_model) — pre-norm before FFN
             tensors.insert(
-                format!("{prefix}.norm1.weight"),
+                format!("{prefix}.ffn_norm.weight"),
                 Tensor::ones(&[config.d_model]),
             );
             tensors.insert(
-                format!("{prefix}.norm1.bias"),
+                format!("{prefix}.ffn_norm.bias"),
                 Tensor::zeros(&[config.d_model]),
             );
+
+            // SwiGLU FFN weights (all bias=False in Python):
+            // ffn_gate: Linear(d_model, d_ffn, bias=False)
+            // ffn_up:   Linear(d_model, d_ffn, bias=False)
+            // ffn_down: Linear(d_ffn, d_model, bias=False)
             tensors.insert(
-                format!("{prefix}.norm2.weight"),
-                Tensor::ones(&[config.d_model]),
+                format!("{prefix}.ffn_gate.weight"),
+                Tensor::zeros(&[config.d_ffn, config.d_model]),
             );
             tensors.insert(
-                format!("{prefix}.norm2.bias"),
-                Tensor::zeros(&[config.d_model]),
+                format!("{prefix}.ffn_up.weight"),
+                Tensor::zeros(&[config.d_ffn, config.d_model]),
+            );
+            tensors.insert(
+                format!("{prefix}.ffn_down.weight"),
+                Tensor::zeros(&[config.d_model, config.d_ffn]),
             );
         }
+
+        // Output normalization: LayerNorm(d_model) — applied after all layers, before heads
+        tensors.insert(
+            "output_norm.weight".to_string(),
+            Tensor::ones(&[config.d_model]),
+        );
+        tensors.insert(
+            "output_norm.bias".to_string(),
+            Tensor::zeros(&[config.d_model]),
+        );
 
         // Output head weights
         tensors.insert(

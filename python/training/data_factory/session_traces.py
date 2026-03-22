@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -41,10 +41,13 @@ class SessionTrace:
     tokens_spent_ratio: torch.Tensor    # (seq_len, 1) cumulative tokens / budget
     error_count: torch.Tensor           # (seq_len, 1) rolling error count
     steps_since_progress: torch.Tensor  # (seq_len, 1) steps since meaningful progress
-    seq_length: int
+    seq_length: Any                     # int for single trace, (batch,) int64 tensor after collation
 
     def to(self, device: torch.device) -> "SessionTrace":
         """Move all tensors to device."""
+        sl = self.seq_length
+        if isinstance(sl, torch.Tensor):
+            sl = sl.to(device)
         return SessionTrace(
             input_slots=self.input_slots.to(device),
             context_candidates=self.context_candidates.to(device),
@@ -53,7 +56,7 @@ class SessionTrace:
             tokens_spent_ratio=self.tokens_spent_ratio.to(device),
             error_count=self.error_count.to(device),
             steps_since_progress=self.steps_since_progress.to(device),
-            seq_length=self.seq_length,
+            seq_length=sl,
         )
 
 
@@ -289,7 +292,11 @@ class SessionTraceDataset(Dataset):
 
 
 def collate_session_traces(batch: List[SessionTrace]) -> SessionTrace:
-    """Collate a list of SessionTrace into a batched version."""
+    """Collate a list of SessionTrace into a batched version.
+
+    seq_length becomes a per-sample int64 tensor of shape (batch,) so that
+    sequence masks can be built correctly per sample in the loss and eval code.
+    """
     return SessionTrace(
         input_slots=torch.stack([t.input_slots for t in batch]),
         context_candidates=torch.stack([t.context_candidates for t in batch]),
@@ -298,5 +305,5 @@ def collate_session_traces(batch: List[SessionTrace]) -> SessionTrace:
         tokens_spent_ratio=torch.stack([t.tokens_spent_ratio for t in batch]),
         error_count=torch.stack([t.error_count for t in batch]),
         steps_since_progress=torch.stack([t.steps_since_progress for t in batch]),
-        seq_length=max(t.seq_length for t in batch),
+        seq_length=torch.tensor([t.seq_length for t in batch], dtype=torch.int64),
     )

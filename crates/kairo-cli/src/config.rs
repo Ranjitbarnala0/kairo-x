@@ -115,16 +115,24 @@ struct BudgetSection {
 fn parse_cost_mode(s: &str) -> CostMode {
     match s.to_lowercase().as_str() {
         "thorough" => CostMode::Thorough,
+        "balanced" => CostMode::Balanced,
         "efficient" => CostMode::Efficient,
-        _ => CostMode::Balanced,
+        other => {
+            tracing::warn!(value = %other, "Unknown cost_mode, defaulting to Balanced");
+            CostMode::Balanced
+        }
     }
 }
 
 fn parse_provider_kind(s: &str) -> ProviderKind {
     match s.to_lowercase().as_str() {
+        "anthropic" => ProviderKind::Anthropic,
         "openai" => ProviderKind::OpenAI,
         "local" => ProviderKind::Local,
-        _ => ProviderKind::Anthropic,
+        other => {
+            tracing::warn!(value = %other, "Unknown provider kind, defaulting to Anthropic");
+            ProviderKind::Anthropic
+        }
     }
 }
 

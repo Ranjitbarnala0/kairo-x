@@ -24,21 +24,17 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 const WHITE: &str = "\x1b[37m";
 
-fn use_color() -> bool {
-    std::env::var("NO_COLOR").is_err() && atty_stdout()
-}
+use std::io::IsTerminal;
 
-/// Check whether stdout is a terminal using libc::isatty on Unix.
-fn atty_stdout() -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        // Conservative default: assume not a terminal on non-Unix
-        false
-    }
+static USE_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn use_color() -> bool {
+    *USE_COLOR.get_or_init(|| {
+        if std::env::var("NO_COLOR").is_ok() {
+            return false;
+        }
+        std::io::stdout().is_terminal()
+    })
 }
 
 /// Wrap `text` in the given ANSI color if colors are enabled.
@@ -257,8 +253,7 @@ pub fn print_status_summary(
         YELLOW,
     );
 
-    if tracker.cost_limit_microdollars > 0 {
-        let remaining = tracker.cost_budget_remaining();
+    if let Some(remaining) = tracker.cost_budget_remaining() {
         let remaining_str = format_cost(remaining);
         let budget_str = format_cost(tracker.cost_limit_microdollars);
         print_row(
@@ -271,8 +266,7 @@ pub fn print_status_summary(
             },
         );
     }
-    if tracker.token_budget > 0 {
-        let remaining = tracker.token_budget_remaining();
+    if let Some(remaining) = tracker.token_budget_remaining() {
         print_row(
             "Token budget remaining",
             &format!("{remaining} / {}", tracker.token_budget),

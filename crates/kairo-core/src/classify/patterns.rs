@@ -91,8 +91,8 @@ pub static UNIVERSAL_PLACEHOLDER_PATTERNS: LazyLock<Vec<CompiledPattern>> = Lazy
         (r"(?i)//\s*stub|#\s*stub|/\*\s*stub", "stub comment"),
         // "not implemented" phrase
         (r"(?i)\bnot\s+(?:yet\s+)?implemented\b", "not-implemented phrase"),
-        // Empty function/method bodies (just braces/pass)
-        (r"(?i)\{\s*\}", "empty braces"),
+        // Empty function/method bodies — require function definition context
+        (r"(?m)^\s*(?:fn|func|function|def|pub fn|pub\(crate\) fn)\s+\w+[^{]*\{\s*\}", "empty function body"),
     ];
 
     raw.iter()

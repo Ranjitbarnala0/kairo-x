@@ -34,7 +34,31 @@ pub enum SnapshotError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error("file too large to snapshot: {path} ({size} bytes, limit {limit} bytes)")]
+    FileTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
+
+    #[error("snapshot memory budget exceeded: current {current} + new {additional} > limit {limit} bytes")]
+    MemoryBudgetExceeded {
+        current: usize,
+        additional: usize,
+        limit: usize,
+    },
 }
+
+// ---------------------------------------------------------------------------
+// Size limits
+// ---------------------------------------------------------------------------
+
+/// Maximum size of a single file that can be snapshotted (50 MB).
+const MAX_SNAPSHOT_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Maximum total memory across all snapshots in a single store (500 MB).
+const MAX_TOTAL_SNAPSHOT_MEMORY: usize = 500 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Snapshot entry
@@ -65,6 +89,8 @@ pub struct Snapshot {
 pub struct SnapshotStore {
     /// Map of canonical file paths to their snapshots.
     snapshots: HashMap<PathBuf, Snapshot>,
+    /// Running total of bytes held in snapshot content.
+    total_memory: usize,
 }
 
 impl SnapshotStore {
@@ -72,6 +98,7 @@ impl SnapshotStore {
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
+            total_memory: 0,
         }
     }
 
@@ -79,6 +106,7 @@ impl SnapshotStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             snapshots: HashMap::with_capacity(capacity),
+            total_memory: 0,
         }
     }
 
@@ -97,6 +125,20 @@ impl SnapshotStore {
         }
 
         let (content, existed) = if path.exists() {
+            // Check file size before reading to avoid loading huge files.
+            let metadata = std::fs::metadata(path).map_err(|e| SnapshotError::ReadFailed {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            let file_size = metadata.len();
+            if file_size > MAX_SNAPSHOT_FILE_SIZE {
+                return Err(SnapshotError::FileTooLarge {
+                    path: path.to_path_buf(),
+                    size: file_size,
+                    limit: MAX_SNAPSHOT_FILE_SIZE,
+                });
+            }
+
             let bytes = std::fs::read(path).map_err(|e| SnapshotError::ReadFailed {
                 path: path.to_path_buf(),
                 source: e,
@@ -106,13 +148,25 @@ impl SnapshotStore {
             (Vec::new(), false)
         };
 
+        // Enforce total memory budget before inserting.
+        let new_size = content.len();
+        if self.total_memory.saturating_add(new_size) > MAX_TOTAL_SNAPSHOT_MEMORY {
+            return Err(SnapshotError::MemoryBudgetExceeded {
+                current: self.total_memory,
+                additional: new_size,
+                limit: MAX_TOTAL_SNAPSHOT_MEMORY,
+            });
+        }
+
         debug!(
             path = %canonical.display(),
-            size = content.len(),
+            size = new_size,
             existed,
+            total_memory = self.total_memory + new_size,
             "file snapshotted"
         );
 
+        self.total_memory += new_size;
         self.snapshots.insert(
             canonical,
             Snapshot {
@@ -128,7 +182,9 @@ impl SnapshotStore {
     /// Snapshot a file, overwriting any existing snapshot.
     pub fn force_snapshot(&mut self, path: &Path) -> Result<(), SnapshotError> {
         let canonical = normalize_path(path);
-        self.snapshots.remove(&canonical);
+        if let Some(old) = self.snapshots.remove(&canonical) {
+            self.total_memory = self.total_memory.saturating_sub(old.content.len());
+        }
         self.snapshot_file(path)
     }
 
@@ -136,6 +192,10 @@ impl SnapshotStore {
     ///
     /// If the file did not exist at snapshot time, it is deleted.
     /// If the file existed, its content is overwritten with the snapshot.
+    ///
+    /// Writes to the canonical path (not the caller-supplied path) to prevent
+    /// TOCTOU attacks where a symlink is swapped between canonicalization and
+    /// the write.
     pub fn restore_file(&mut self, path: &Path) -> Result<(), SnapshotError> {
         let canonical = normalize_path(path);
 
@@ -145,26 +205,29 @@ impl SnapshotStore {
             .ok_or_else(|| SnapshotError::NoSnapshot(canonical.clone()))?;
 
         if snapshot.existed {
-            // Ensure parent directory exists.
-            if let Some(parent) = path.parent() {
+            // Ensure parent directory exists -- use the canonical path.
+            if let Some(parent) = canonical.parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent).map_err(|e| SnapshotError::WriteFailed {
-                        path: path.to_path_buf(),
+                        path: canonical.clone(),
                         source: e,
                     })?;
                 }
             }
 
-            std::fs::write(path, &snapshot.content).map_err(|e| SnapshotError::WriteFailed {
-                path: path.to_path_buf(),
-                source: e,
+            std::fs::write(&canonical, &snapshot.content).map_err(|e| {
+                SnapshotError::WriteFailed {
+                    path: canonical.clone(),
+                    source: e,
+                }
             })?;
             debug!(path = %canonical.display(), "file restored from snapshot");
         } else {
-            // File didn't exist before — delete it if it exists now.
-            if path.exists() {
-                std::fs::remove_file(path).map_err(|e| SnapshotError::WriteFailed {
-                    path: path.to_path_buf(),
+            // File didn't exist before -- delete it if it exists now.
+            // Use the canonical path to avoid symlink misdirection.
+            if canonical.exists() {
+                std::fs::remove_file(&canonical).map_err(|e| SnapshotError::WriteFailed {
+                    path: canonical.clone(),
                     source: e,
                 })?;
                 debug!(path = %canonical.display(), "file deleted (did not exist at snapshot time)");
@@ -246,17 +309,20 @@ impl SnapshotStore {
     /// Returns `true` if a snapshot was discarded, `false` if none existed.
     pub fn discard(&mut self, path: &Path) -> bool {
         let canonical = normalize_path(path);
-        let removed = self.snapshots.remove(&canonical).is_some();
-        if removed {
+        if let Some(old) = self.snapshots.remove(&canonical) {
+            self.total_memory = self.total_memory.saturating_sub(old.content.len());
             debug!(path = %canonical.display(), "snapshot discarded");
+            true
+        } else {
+            false
         }
-        removed
     }
 
     /// Discard all snapshots.
     pub fn discard_all(&mut self) {
         let count = self.snapshots.len();
         self.snapshots.clear();
+        self.total_memory = 0;
         debug!(count, "all snapshots discarded");
     }
 
@@ -294,10 +360,25 @@ impl Default for SnapshotStore {
 
 /// Normalize a path for use as a consistent map key.
 ///
-/// Attempts canonicalization; falls back to the path as-is if the file
-/// doesn't exist yet (e.g., for new files that will be created).
+/// Attempts full canonicalization first. If the file doesn't exist yet,
+/// canonicalizes the parent directory and appends the filename. This ensures
+/// that symlinks in the directory portion are resolved even for new files,
+/// preventing distinct map keys for the same real location.
 fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // File doesn't exist yet; canonicalize the parent + append filename.
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                match parent.canonicalize() {
+                    Ok(canonical_parent) => canonical_parent.join(name),
+                    Err(_) => path.to_path_buf(), // last resort fallback
+                }
+            } else {
+                path.to_path_buf()
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

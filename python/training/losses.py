@@ -373,7 +373,7 @@ class CombinedLoss(nn.Module):
         # Import here to avoid circular imports
         from training.data_factory.pipeline import TrainingBatch
 
-        total_loss = torch.tensor(0.0, device=outputs["action_logits"].device)
+        total_loss = torch.zeros(1, device=outputs["action_logits"].device, requires_grad=True)
         components: Dict[str, float] = {}
 
         # --- Context selection loss ---
@@ -402,11 +402,14 @@ class CombinedLoss(nn.Module):
         if batch.action_labels is not None:
             seq_mask = None
             if batch.is_sequence:
-                # Create sequence mask from seq_length
+                # Create per-sample sequence mask from seq_length tensor (B,)
                 B, T = batch.action_labels.shape
+                seq_len = batch.seq_length
+                if not isinstance(seq_len, torch.Tensor):
+                    seq_len = torch.tensor([seq_len] * B, device=batch.action_labels.device)
                 seq_mask = torch.arange(T, device=batch.action_labels.device).unsqueeze(
                     0
-                ).expand(B, -1) < batch.seq_length
+                ).expand(B, -1) < seq_len.unsqueeze(1)
 
             act_loss = self.action_loss(
                 outputs["action_logits"],
@@ -421,9 +424,12 @@ class CombinedLoss(nn.Module):
             seq_mask = None
             if batch.is_sequence:
                 B, T = batch.enforcement_labels.shape[:2]
+                seq_len = batch.seq_length
+                if not isinstance(seq_len, torch.Tensor):
+                    seq_len = torch.tensor([seq_len] * B, device=batch.enforcement_labels.device)
                 seq_mask = torch.arange(T, device=batch.enforcement_labels.device).unsqueeze(
                     0
-                ).expand(B, -1) < batch.seq_length
+                ).expand(B, -1) < seq_len.unsqueeze(1)
 
             enf_loss = self.enforcement_loss(
                 outputs["enforcement_intensity"],
@@ -438,9 +444,12 @@ class CombinedLoss(nn.Module):
             seq_mask = None
             if batch.is_sequence:
                 B, T = batch.stop_labels.shape
+                seq_len = batch.seq_length
+                if not isinstance(seq_len, torch.Tensor):
+                    seq_len = torch.tensor([seq_len] * B, device=batch.stop_labels.device)
                 seq_mask = torch.arange(T, device=batch.stop_labels.device).unsqueeze(
                     0
-                ).expand(B, -1) < batch.seq_length
+                ).expand(B, -1) < seq_len.unsqueeze(1)
 
             stp_loss = self.stop_loss(
                 outputs["stop_logits"],
@@ -456,9 +465,12 @@ class CombinedLoss(nn.Module):
             seq_mask = None
             if batch.is_sequence:
                 B, T = batch.session_labels.shape
+                seq_len = batch.seq_length
+                if not isinstance(seq_len, torch.Tensor):
+                    seq_len = torch.tensor([seq_len] * B, device=batch.session_labels.device)
                 seq_mask = torch.arange(T, device=batch.session_labels.device).unsqueeze(
                     0
-                ).expand(B, -1) < batch.seq_length
+                ).expand(B, -1) < seq_len.unsqueeze(1)
 
             ses_loss = self.session_loss(
                 outputs["session_edge_case"],
